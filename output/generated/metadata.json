@@ -1,0 +1,10 @@
+{
+  "component_name": "GeneratedComponent",
+  "ds_components_used": [],
+  "imports": [
+    "CommonModule",
+    "MatCardModule",
+    "MatButtonModule"
+  ],
+  "unresolved_nodes": []
+}
