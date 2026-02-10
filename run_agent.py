@@ -7,7 +7,7 @@ Demonstrates how to use the workflow with your files.
 import json
 import os
 from pathlib import Path
-from figma_to_angular_agent import run_figma_to_angular
+from figma_to_angular_agent import run_figma_to_angular, METRICS
 
 def main():
     # 1. Load required inputs
@@ -91,7 +91,16 @@ def main():
         for node in result.unresolved_nodes[:3]:
             print(f"  - {node}")
 
-    print(f"\nðŸ“‚ Output directory: {output_dir.absolute()}")
+    # 7. Save pipeline log trace
+    log_path = output_dir / "pipeline_log.txt"
+    with open(log_path, "w") as f:
+        f.write(METRICS.summary())
+        f.write("\n\nDETAILED LOG TRACE:\n")
+        for entry in METRICS.log_trace:
+            f.write(f"  [{entry['step']}] {entry['message']}\n")
+    print(f"  Pipeline log saved to {log_path}")
+
+    print(f"\nOutput directory: {output_dir.absolute()}")
     print("\nNext steps:")
     print("  1. Review generated files in output/generated/")
     print("  2. Copy to your Angular project src/app/")

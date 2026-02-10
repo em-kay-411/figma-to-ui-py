@@ -2,11 +2,12 @@
 # Fixed version with better error handling
 
 from typing import TypedDict, List, Dict, Any, Annotated, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import os
 import base64
 import requests
+import time
 from enum import Enum
 
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
@@ -35,6 +36,79 @@ class Config:
     MAX_JSON_SIZE = 100000
     # Enable screenshot analysis for better styling
     USE_SCREENSHOT_ANALYSIS = True
+
+
+# ============================================================================
+# PIPELINE METRICS & LOGGING
+# ============================================================================
+
+class PipelineMetrics:
+    """Tracks LLM call counts, character usage, step timings, and log trace."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.llm_calls: int = 0
+        self.llm_total_input_chars: int = 0
+        self.llm_total_output_chars: int = 0
+        self.step_timings: Dict[str, Dict[str, float]] = {}
+        self.log_trace: List[Dict[str, Any]] = []
+
+    def record_llm_call(self, input_chars: int = 0, output_chars: int = 0, step: str = ""):
+        self.llm_calls += 1
+        self.llm_total_input_chars += input_chars
+        self.llm_total_output_chars += output_chars
+        self._log(step or "llm_call", f"LLM call #{self.llm_calls}: {input_chars} in / {output_chars} out chars")
+
+    def start_step(self, step_name: str):
+        self.step_timings[step_name] = {"start": time.time(), "end": 0.0}
+        self._log(step_name, f"Step started")
+
+    def end_step(self, step_name: str):
+        if step_name in self.step_timings:
+            self.step_timings[step_name]["end"] = time.time()
+            elapsed = self.step_timings[step_name]["end"] - self.step_timings[step_name]["start"]
+            self._log(step_name, f"Step completed in {elapsed:.2f}s")
+
+    def _log(self, step: str, message: str):
+        self.log_trace.append({
+            "step": step,
+            "message": message,
+            "timestamp": time.time(),
+        })
+
+    def summary(self) -> str:
+        lines = [
+            "",
+            "=" * 60,
+            "PIPELINE METRICS SUMMARY",
+            "=" * 60,
+            f"Total LLM calls:        {self.llm_calls}",
+            f"Total input chars:      {self.llm_total_input_chars:,}",
+            f"Total output chars:     {self.llm_total_output_chars:,}",
+            "",
+            "Step Timings:",
+        ]
+        for step_name, t in self.step_timings.items():
+            elapsed = t["end"] - t["start"] if t["end"] else time.time() - t["start"]
+            lines.append(f"  {step_name:30s}  {elapsed:8.2f}s")
+
+        total_time = 0.0
+        for t in self.step_timings.values():
+            if t["end"]:
+                total_time += t["end"] - t["start"]
+        lines.append(f"  {'TOTAL':30s}  {total_time:8.2f}s")
+
+        lines.append("")
+        lines.append("Log Trace:")
+        for entry in self.log_trace:
+            lines.append(f"  [{entry['step']}] {entry['message']}")
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
+
+METRICS = PipelineMetrics()
 
 
 # ============================================================================
@@ -158,6 +232,7 @@ Output ONLY the JSON object, no markdown or explanation."""
         ]
 
         response = llm.invoke(messages)
+        METRICS.record_llm_call(len(design_context[:2000]), len(response.content), "screenshot_analysis")
         content = response.content.strip()
 
         # Parse JSON response
@@ -195,6 +270,30 @@ class IRNodeType(str, Enum):
     ICON = "icon"
     CARD = "card"
     LIST = "list"
+    TOOLBAR = "toolbar"
+    DIVIDER = "divider"
+    CHIP = "chip"
+    BADGE = "badge"
+    TAB = "tab"
+    MENU = "menu"
+    DIALOG = "dialog"
+    FORM_FIELD = "form-field"
+    SELECT = "select"
+    CHECKBOX = "checkbox"
+    RADIO = "radio"
+    TOGGLE = "toggle"
+    SLIDER = "slider"
+    PROGRESS = "progress"
+    STEPPER = "stepper"
+    TABLE = "table"
+    EXPANSION_PANEL = "expansion-panel"
+    SIDENAV = "sidenav"
+    NAV = "nav"
+    HEADER = "header"
+    FOOTER = "footer"
+    LINK = "link"
+    AVATAR = "avatar"
+    FORM = "form"
     UNKNOWN = "unknown"
 
 @dataclass
@@ -217,7 +316,7 @@ class DSComponentMapping(BaseModel):
     figma_node_id: str
     ds_component: str
     ds_selector: str
-    inputs: Dict[str, str]
+    inputs: Dict[str, str] = {}
     outputs: Dict[str, str] = {}
     children_slot: Optional[str] = None
 
@@ -304,7 +403,33 @@ def get_component_by_intent(intent: str) -> str:
         "icon": ["icon"],
         "image": ["image", "img"],
         "container": ["container", "box", "layout"],
-        "list": ["list", "item"]
+        "list": ["list", "item"],
+        "toolbar": ["toolbar"],
+        "divider": ["divider"],
+        "chip": ["chip"],
+        "tab": ["tab"],
+        "menu": ["menu"],
+        "form-field": ["form-field", "form"],
+        "select": ["select"],
+        "checkbox": ["checkbox"],
+        "radio": ["radio"],
+        "toggle": ["toggle", "slide-toggle"],
+        "slider": ["slider"],
+        "progress": ["progress"],
+        "stepper": ["stepper", "step"],
+        "table": ["table"],
+        "expansion": ["expansion", "accordion"],
+        "dialog": ["dialog"],
+        "badge": ["badge"],
+        "snackbar": ["snack-bar"],
+        "tooltip": ["tooltip"],
+        "paginator": ["paginator"],
+        "sidenav": ["sidenav", "drawer"],
+        "datepicker": ["datepicker"],
+        "autocomplete": ["autocomplete"],
+        "grid": ["grid"],
+        "nav": ["nav"],
+        "avatar": ["avatar"],
     }
 
     keywords = intent_mapping.get(intent.lower(), [intent.lower()])
@@ -377,6 +502,7 @@ def search_components(keyword: str) -> str:
 
 def ingest_figma_node(state: AgentState) -> AgentState:
     """Step 1: Clean and normalize Figma JSON"""
+    METRICS.start_step("ingest_figma")
     figma = state["figma_json"]
     
     def clean_node(node: Dict) -> Optional[Dict]:
@@ -557,6 +683,7 @@ def ingest_figma_node(state: AgentState) -> AgentState:
         SystemMessage(content=f"Figma tree cleaned. Root: {cleaned_figma.get('name', 'Unknown')} (Type: {cleaned_figma.get('type', 'Unknown')}), {node_count} nodes")
     )
 
+    METRICS.end_step("ingest_figma")
     return state
 
 def _flatten_figma_tree(node: Dict, parent_id: Optional[str] = None, depth: int = 0) -> List[Dict]:
@@ -655,6 +782,7 @@ def _parse_llm_json_response(content: str) -> Any:
 
 def build_ir_node(state: AgentState) -> AgentState:
     """Step 2: Convert Figma JSON to IR using chunked processing for large trees."""
+    METRICS.start_step("build_ir")
     llm = ChatOpenAI(model=Config.LLM_MODEL, temperature=Config.LLM_TEMPERATURE)
 
     figma_tree = state["figma_json"]
@@ -684,6 +812,7 @@ def build_ir_node(state: AgentState) -> AgentState:
     else:
         state["ir_tree"] = []
 
+    METRICS.end_step("build_ir")
     return state
 
 
@@ -742,8 +871,10 @@ IMPORTANT:
 
     try:
         print('Invoking LLM for full tree IR generation...')
-        print(f'  Sending {len(json.dumps(compact_tree))} chars to LLM')
+        input_chars = len(json.dumps(compact_tree))
+        print(f'  Sending {input_chars} chars to LLM')
         response = llm.invoke(messages)
+        METRICS.record_llm_call(input_chars, len(response.content), "build_ir")
         print('LLM response received.')
         print(f'  Response length: {len(response.content)} chars')
         print(f'  Response preview: {response.content[:500]}...')
@@ -842,7 +973,9 @@ IMPORTANT: Output ONLY valid JSON, no markdown. Include ALL input nodes in outpu
         ]
 
         try:
+            chunk_input_chars = len(json.dumps(chunk))
             response = llm.invoke(messages)
+            METRICS.record_llm_call(chunk_input_chars, len(response.content), "build_ir")
             chunk_ir = _parse_llm_json_response(response.content)
 
             if isinstance(chunk_ir, dict):
@@ -921,6 +1054,7 @@ def _flatten_ir_nodes(ir_nodes: List[Dict], parent_id: Optional[str] = None) -> 
 
 def map_to_design_system_node(state: AgentState) -> AgentState:
     """Step 3: Map IR to DS components with chunked processing for large trees."""
+    METRICS.start_step("map_to_ds")
 
     # Early exit if no IR tree
     if not state.get("ir_tree"):
@@ -966,15 +1100,40 @@ For each IR node:
 2. Use the tools to explore available components and their APIs
 3. Map the IR node properties to component inputs
 
+IMPORTANT: Always prefer Angular Material components over raw HTML elements.
+Every UI element should be mapped to a Material component when possible.
+
 Common mappings:
 - text → <span>, <p>, <h1-h6>, or mat-card-title/mat-card-content
-- button → <button mat-button>, <button mat-raised-button>, <button mat-flat-button>
-- input → <input matInput>, <mat-form-field>
-- card → <mat-card>
-- container → <div> with appropriate layout classes
-- list → <mat-list>, <mat-nav-list>
+- button → <button mat-button>, <button mat-raised-button>, <button mat-flat-button>, <button mat-fab>, <button mat-mini-fab>, <button mat-icon-button>
+- input → <input matInput> inside <mat-form-field>
+- card → <mat-card> with <mat-card-header>, <mat-card-content>, <mat-card-actions>
+- container → <div> with layout classes, or <mat-card> for sections, <mat-sidenav-container> for layouts
+- list → <mat-list>, <mat-nav-list>, <mat-selection-list>
 - icon → <mat-icon>
 - image → <img>
+- toolbar/header → <mat-toolbar>
+- divider/separator → <mat-divider>
+- chip/tag/badge → <mat-chip-listbox> with <mat-chip>, or matBadge directive
+- tab → <mat-tab-group> with <mat-tab>
+- menu/dropdown → <mat-menu> with mat-menu-item
+- form-field → <mat-form-field> wrapping matInput, mat-select, etc.
+- select/dropdown → <mat-select> with <mat-option>
+- checkbox → <mat-checkbox>
+- radio → <mat-radio-group> with <mat-radio-button>
+- toggle/switch → <mat-slide-toggle>
+- slider → <mat-slider>
+- progress/loading → <mat-progress-bar> or <mat-progress-spinner>
+- stepper/wizard → <mat-stepper> with <mat-step>
+- table/grid → <mat-table> or <table mat-table>
+- expansion/accordion → <mat-accordion> with <mat-expansion-panel>
+- dialog/modal → MatDialog service
+- tooltip → matTooltip directive
+- paginator → <mat-paginator>
+- sidenav/drawer → <mat-sidenav> inside <mat-sidenav-container>
+- datepicker → <mat-datepicker> with <input matInput>
+- autocomplete → <mat-autocomplete>
+- nav → <mat-nav-list> or <nav mat-tab-nav-bar>
 
 Output JSON array of mappings. Example:
 [
@@ -1005,7 +1164,7 @@ IMPORTANT:
         print(f"Mapping chunk {i+1}/{len(chunks)} ({len(chunk)} nodes)...")
 
         formatted_prompt = system_prompt.format(
-            ds_summary=json.dumps(ds_components_summary[:20], indent=2)  # First 20 components
+            ds_summary=json.dumps(ds_components_summary[:50], indent=2)  # First 50 components
         )
 
         messages = [
@@ -1018,7 +1177,9 @@ IMPORTANT:
         iteration = 0
 
         while iteration < max_iterations:
+            msg_input_chars = sum(len(str(m.content)) for m in messages)
             response = llm_with_tools.invoke(messages)
+            METRICS.record_llm_call(msg_input_chars, len(str(response.content)), "map_to_ds")
             messages.append(response)
 
             if not response.tool_calls:
@@ -1066,7 +1227,20 @@ IMPORTANT:
         )
         state["component_mappings"] = []
 
+    METRICS.end_step("map_to_ds")
     return state
+
+def _collect_descendant_texts(node: Dict) -> List[str]:
+    """Recursively collect text from all descendant TEXT-type nodes."""
+    texts = []
+    for child in node.get("children", []):
+        if child.get("type") == "TEXT":
+            text = child.get("properties", {}).get("text") or child.get("characters")
+            if text:
+                texts.append(text)
+        texts.extend(_collect_descendant_texts(child))
+    return texts
+
 
 def _build_design_structure_for_codegen(figma_json: Dict, ir_tree: List[Dict], mappings: List, max_depth: int = 8) -> Dict:
     """Build a comprehensive design structure for code generation using Figma data."""
@@ -1208,6 +1382,13 @@ def _build_design_structure_for_codegen(figma_json: Dict, ir_tree: List[Dict], m
                 if (child_info := extract_node_info(child, depth + 1)) is not None
             ]
 
+        # Collect innerText from descendant TEXT nodes
+        # This gives the LLM the actual display text for elements like buttons
+        if not info.get("text") and children:
+            collected_texts = _collect_descendant_texts(node)
+            if collected_texts:
+                info["innerText"] = " ".join(collected_texts)
+
         return info
 
     # Build from Figma JSON if available and has structure
@@ -1237,6 +1418,12 @@ def _build_design_structure_for_codegen(figma_json: Dict, ir_tree: List[Dict], m
             children = ir_node.get("children", [])
             if children:
                 info["children"] = [ir_to_structure(c, depth + 1) for c in children]
+
+            # Collect innerText from descendant TEXT nodes in IR fallback
+            if not info.get("text") and children:
+                collected_texts = _collect_descendant_texts(ir_node)
+                if collected_texts:
+                    info["innerText"] = " ".join(collected_texts)
 
             return info
 
@@ -1291,6 +1478,7 @@ def _build_component_hierarchy_context(ir_tree: List[Dict], mappings: List, max_
 
 def generate_angular_code_node(state: AgentState) -> AgentState:
     """Step 4: Generate Angular code with full tree context."""
+    METRICS.start_step("generate_code")
 
     # Get IR tree - if empty, use cleaned Figma JSON directly
     ir_tree = state.get("ir_tree", [])
@@ -1355,15 +1543,49 @@ CRITICAL INSTRUCTIONS:
 2. Generate code that MATCHES this specific design - NOT generic placeholder code
 3. Every text node in the design should appear in your HTML template
 4. Every container/frame should be represented with proper flexbox/grid layout
-5. Use Angular Material components where appropriate
+5. **MAXIMIZE Angular Material component usage** - prefer Material components over raw HTML in every case
 
 The design structure contains:
-- name: The node name from Figma
+- name: The Figma layer name (DO NOT use as display text — names like "Button", "Base", "Frame" are internal Figma layer names)
 - type: FRAME, TEXT, GROUP, COMPONENT, etc.
 - layout: layoutMode (VERTICAL/HORIZONTAL), alignment info
 - children: Nested child elements
-- properties: Text content (in "text" field), styling info
+- text: Actual text content for TEXT nodes
+- innerText: Aggregated text from descendant TEXT nodes — use this as the element's display text (e.g., button label, link text)
 - styling: Colors, fonts, effects
+
+CRITICAL TEXT RULES:
+- When a node has an "innerText" field, use that as the element's text content (e.g., button label)
+- When a node has a "text" field, use that as the element's text content
+- NEVER use the node "name" as display text — names like "Button", "Base", "Frame 1037" are Figma layer names, NOT user-visible text
+- Actual display text comes ONLY from "text" or "innerText" fields
+
+ANGULAR MATERIAL COMPONENT MAPPING GUIDE - Use these aggressively:
+- Sections/cards/panels → <mat-card> with <mat-card-header>, <mat-card-content>, <mat-card-actions>
+- Headers/toolbars/top bars → <mat-toolbar> with <mat-toolbar-row>
+- Navigation/nav bars → <nav mat-tab-nav-bar> or <mat-nav-list>
+- Lists of items → <mat-list> with <mat-list-item>
+- Buttons → <button mat-raised-button>, <button mat-flat-button>, <button mat-icon-button>, <button mat-fab>
+- Text inputs → <mat-form-field> with <input matInput>
+- Dropdowns/selects → <mat-form-field> with <mat-select> and <mat-option>
+- Checkboxes → <mat-checkbox>
+- Radio buttons → <mat-radio-group> with <mat-radio-button>
+- Toggles/switches → <mat-slide-toggle>
+- Sliders → <mat-slider>
+- Icons → <mat-icon>
+- Dividers/separators/lines → <mat-divider>
+- Chips/tags/badges → <mat-chip-listbox> with <mat-chip> or matBadge directive
+- Tabs → <mat-tab-group> with <mat-tab>
+- Menus/dropdowns → <mat-menu> with <button mat-menu-item>
+- Tables/data grids → <table mat-table> with matColumnDef
+- Expansion/accordion → <mat-accordion> with <mat-expansion-panel>
+- Progress indicators → <mat-progress-bar> or <mat-progress-spinner>
+- Steppers/wizards → <mat-stepper> with <mat-step>
+- Side navigation → <mat-sidenav-container> with <mat-sidenav>
+- Tooltips → matTooltip directive on elements
+- Date pickers → <mat-datepicker> inside <mat-form-field>
+- Autocomplete → <mat-autocomplete> inside <mat-form-field>
+- Paginator → <mat-paginator>
 
 GENERATE:
 
@@ -1371,13 +1593,16 @@ GENERATE:
 ```typescript
 import { Component, ChangeDetectionStrategy } from '@angular/core';
 import { CommonModule } from '@angular/common';
+// Import ALL Angular Material modules that you use in the template
 import { MatCardModule } from '@angular/material/card';
-// ... other imports based on design
+import { MatToolbarModule } from '@angular/material/toolbar';
+import { MatIconModule } from '@angular/material/icon';
+// ... etc for every mat-* element used
 
 @Component({
   selector: 'app-component-name',
   standalone: true,
-  imports: [CommonModule, MatCardModule, ...],
+  imports: [CommonModule, MatCardModule, MatToolbarModule, MatIconModule, ...],
   templateUrl: './component-name.component.html',
   styleUrls: ['./component-name.component.scss'],
   changeDetection: ChangeDetectionStrategy.OnPush
@@ -1386,12 +1611,15 @@ export class ComponentNameComponent { }
 ```
 
 2. HTML Template - MUST include ALL text and structure from the design:
-- Use <mat-card> for card-like frames
-- Use <h1>-<h6> for headings based on text size/hierarchy
-- Use <p>, <span> for body text
-- Use <button mat-button> or <button mat-raised-button> for buttons
-- Use flexbox containers with classes like "flex-row", "flex-column"
+- Use <mat-card> for ANY card-like or section frame
+- Use <mat-toolbar> for ANY header or top bar
+- Use <mat-list> for ANY list of similar items
+- Use <mat-divider> between sections or list items
+- Use <mat-icon> wherever icons or icon-like elements appear
+- Use <button mat-raised-button> or <button mat-flat-button> for buttons
+- Wrap text inputs in <mat-form-field> with <input matInput>
 - Include ALL text content from the design
+- Use flexbox containers with classes like "flex-row", "flex-column" only when no Material layout component fits
 
 3. SCSS Styles:
 - .flex-row { display: flex; flex-direction: row; }
@@ -1399,11 +1627,16 @@ export class ComponentNameComponent { }
 - Apply colors, gaps, padding from the design
 - Use proper spacing based on layout info
 
+4. ds_components_used: Populate this array with EVERY Angular Material component used in the template.
+   For each Material component, include: figma_node_id, ds_component name, ds_selector, inputs, outputs.
+
 IMPORTANT:
 - DO NOT generate placeholder text like "Sample Component" or "This is a sample"
 - USE the ACTUAL text content from the design structure
 - PRESERVE the visual hierarchy exactly as shown in the design
-- Apply the EXACT styling from the style properties (padding, gap, colors, fonts)"""
+- Apply the EXACT styling from the style properties (padding, gap, colors, fonts)
+- MAXIMIZE Material component usage - every UI element should use a Material component if one exists for that purpose
+- The TypeScript file MUST import the module for every mat-* element used in the HTML"""
 
     # Add screenshot styling instructions if available
     if screenshot_styling:
@@ -1427,14 +1660,32 @@ This visual analysis takes precedence for styling - use it to make the component
     if len(design_json) > Config.MAX_JSON_SIZE:
         design_json = json.dumps(design_structure)[:Config.MAX_JSON_SIZE]
 
+    # Build dynamic list of available Angular Material components from DS_CATALOG
+    available_material = []
+    for selector in DS_CATALOG.get("components", {}):
+        if "mat-" in selector or "mat" in selector.lower():
+            available_material.append(selector)
+    if not available_material:
+        # Fallback if catalog is empty
+        available_material = [
+            "mat-card", "mat-button", "mat-icon", "mat-form-field",
+            "mat-input", "mat-list", "mat-divider", "mat-toolbar",
+            "mat-checkbox", "mat-radio-button", "mat-select", "mat-slide-toggle",
+            "mat-slider", "mat-menu", "mat-tab-group", "mat-expansion-panel",
+            "mat-table", "mat-paginator", "mat-progress-bar", "mat-progress-spinner",
+            "mat-chip", "mat-badge", "mat-tooltip", "mat-stepper",
+            "mat-sidenav", "mat-datepicker", "mat-autocomplete", "mat-nav-list"
+        ]
+
+    # Build component hierarchy context from DS mappings (connects mapping step to generation)
+    component_hierarchy = _build_component_hierarchy_context(ir_tree, mappings)
+
     context = {
         "component_name": root_name,
         "design_structure": design_structure,
+        "component_hierarchy_with_ds_mappings": component_hierarchy,
         "mappings_count": len(mappings),
-        "available_angular_material": [
-            "mat-card", "mat-button", "mat-icon", "mat-form-field",
-            "mat-input", "mat-list", "mat-divider", "mat-toolbar"
-        ]
+        "available_angular_material": available_material
     }
 
     # Add screenshot styling to context if available
@@ -1456,7 +1707,9 @@ This visual analysis takes precedence for styling - use it to make the component
 
     try:
         print(f"Generating Angular component: {root_name}...")
+        input_chars = len(context_str)
         generated = structured_llm.invoke(messages)
+        METRICS.record_llm_call(input_chars, sum(len(f.content) for f in generated.files), "generate_code")
         state["generated"] = generated
         state["messages"].append(AIMessage(content=f"Generated {len(generated.files)} files for {root_name}"))
         print(f"Generated {len(generated.files)} files")
@@ -1473,10 +1726,12 @@ This visual analysis takes precedence for styling - use it to make the component
             )
         )
 
+    METRICS.end_step("generate_code")
     return state
 
 def validate_node(state: AgentState) -> AgentState:
     """Step 5: Validate generated code"""
+    METRICS.start_step("validate")
     errors = []
     generated = state.get("generated")
 
@@ -1516,6 +1771,33 @@ def validate_node(state: AgentState) -> AgentState:
     if warnings:
         print(f"  Validation warnings: {warnings[:3]}")
 
+    # Check Angular Material usage rate in generated HTML
+    html_files = [f for f in generated.files if f.file_type in ("html", "template") or f.path.endswith(".html")]
+    for html_file in html_files:
+        content = html_file.content
+        mat_count = content.count("mat-") + content.count("matInput") + content.count("matTooltip") + content.count("matBadge")
+        # Count total HTML elements as a rough baseline
+        tag_count = content.count("<") - content.count("</") - content.count("<!--")
+        tag_count = max(tag_count, 1)
+        mat_ratio = mat_count / tag_count
+
+        print(f"  Material usage in {html_file.path}: {mat_count} mat-* references out of ~{tag_count} elements ({mat_ratio:.0%})")
+
+        if mat_count < 2 and tag_count > 5:
+            errors.append(ValidationError(
+                file_path=html_file.path,
+                error_type="low_material_usage",
+                message=f"Low Angular Material usage: only {mat_count} Material references found in {tag_count} elements. Use mat-card for sections, mat-toolbar for headers, mat-list for lists, mat-divider between sections, mat-icon for icons, mat-button for buttons."
+            ))
+            print(f"  WARNING: Low Material usage detected, will trigger repair")
+
+    # Check that ds_components_used is populated
+    if not generated.ds_components_used and html_files:
+        for html_file in html_files:
+            if "mat-" in html_file.content:
+                print(f"  WARNING: ds_components_used is empty but HTML contains mat-* elements")
+                break
+
     # Only add critical errors that would prevent compilation
     state["validation_errors"] = errors
 
@@ -1524,10 +1806,12 @@ def validate_node(state: AgentState) -> AgentState:
     else:
         print("  Validation passed!")
 
+    METRICS.end_step("validate")
     return state
 
 def repair_node(state: AgentState) -> AgentState:
     """Step 6: Repair code based on errors"""
+    METRICS.start_step("repair")
     print(f"Attempting repair #{state.get('repair_attempt', 0) + 1}...")
 
     # Increment repair attempt FIRST to prevent infinite loops
@@ -1557,6 +1841,12 @@ def repair_node(state: AgentState) -> AgentState:
         else:
             mappings_data.append(m)
 
+    # Include current generated code for context
+    current_files = {}
+    if state.get("generated") and state["generated"].files:
+        for f in state["generated"].files:
+            current_files[f.path] = f.content
+
     repair_prompt = f"""Previous generation had errors:
 
 {errors_summary}
@@ -1564,11 +1854,30 @@ def repair_node(state: AgentState) -> AgentState:
 Context (component mappings):
 {json.dumps(mappings_data, indent=2)}
 
+Current generated files:
+{json.dumps(current_files, indent=2)[:50000]}
+
 Fix ALL errors and regenerate complete Angular component code.
-Generate proper TypeScript, HTML template, and SCSS files."""
+Generate proper TypeScript, HTML template, and SCSS files.
+
+IMPORTANT - MAXIMIZE Angular Material component usage:
+- Use <mat-card> for sections and card-like containers
+- Use <mat-toolbar> for headers and top bars
+- Use <mat-list> with <mat-list-item> for lists
+- Use <mat-divider> between sections
+- Use <mat-icon> for icons
+- Use <button mat-raised-button> or <button mat-flat-button> for buttons
+- Use <mat-form-field> with <input matInput> for text inputs
+- Use <mat-select> for dropdowns
+- Use <mat-checkbox>, <mat-radio-button>, <mat-slide-toggle> for controls
+- Use <mat-tab-group> for tabs, <mat-expansion-panel> for expandable sections
+- Every Material module used in the template MUST be imported in the TypeScript file
+- Populate ds_components_used with ALL Material components used"""
 
     try:
+        repair_input_chars = len(repair_prompt)
         repaired = structured_llm.invoke([HumanMessage(content=repair_prompt)])
+        METRICS.record_llm_call(repair_input_chars, sum(len(f.content) for f in repaired.files), "repair")
         state["generated"] = repaired
         state["messages"].append(AIMessage(content=f"Repair attempt {state['repair_attempt']} complete"))
         print(f"  Repair generated {len(repaired.files)} files")
@@ -1577,6 +1886,7 @@ Generate proper TypeScript, HTML template, and SCSS files."""
         # Don't add more errors - just log and continue
         state["messages"].append(AIMessage(content=f"Repair attempt {state['repair_attempt']} failed: {str(e)}"))
 
+    METRICS.end_step("repair")
     return state
 
 def should_repair(state: AgentState) -> str:
@@ -1628,6 +1938,7 @@ def run_figma_to_angular(
     figma_screenshots: Optional[Dict[str, str]] = None
 ) -> GeneratedAngularArtifact:
     """Main entry point"""
+    METRICS.reset()
     initialize_catalog(ds_json, design_tokens)
 
     # Extract thumbnail URL from original Figma JSON before processing
@@ -1652,6 +1963,9 @@ def run_figma_to_angular(
     # Set recursion limit to prevent infinite loops (max 10 iterations through the graph)
     final_state = workflow.invoke(initial_state, config={"recursion_limit": 50})
     print('workflow invoked.')
+
+    # Print metrics summary
+    print(METRICS.summary())
 
     # FIX: Return generated artifact or create empty one
     if final_state.get("generated"):
