@@ -6,10 +6,21 @@ Demonstrates how to use the workflow with your files.
 
 import json
 import os
+import sys
 from pathlib import Path
 from figma_to_angular_agent import run_figma_to_angular, METRICS
 
 def main():
+    # Accept design system name as CLI argument (required)
+    if len(sys.argv) < 2:
+        print("Usage: python run_agent.py <design_system_name>")
+        print("  Example: python run_agent.py primeng")
+        print("  The name maps to design_systems/<name>.json if it exists,")
+        print("  otherwise a new config will be auto-generated from documentation.json.")
+        sys.exit(1)
+    design_system = sys.argv[1]
+    print(f"Design system: {design_system}")
+
     # 1. Load required inputs
     print("ðŸ“ Loading input files...")
 
@@ -41,7 +52,8 @@ def main():
         figma_json=figma_data,
         ds_json=ds_data,
         design_tokens=design_tokens,
-        figma_screenshots={"main" : ""}
+        figma_screenshots={"main" : ""},
+        design_system=design_system
     )
 
     print("files:", len(result.files))

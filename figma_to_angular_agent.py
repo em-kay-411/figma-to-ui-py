@@ -36,6 +36,171 @@ class Config:
     MAX_JSON_SIZE = 100000
     # Enable screenshot analysis for better styling
     USE_SCREENSHOT_ANALYSIS = True
+    # Path to design system mappings directory
+    DS_MAPPINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "design_systems")
+
+
+# ============================================================================
+# DESIGN SYSTEM MAPPING REGISTRY
+# ============================================================================
+
+def load_ds_config(design_system: str) -> Optional[Dict[str, Any]]:
+    """Load a design system mapping config from the design_systems/ directory.
+
+    Args:
+        design_system: Name of the design system (e.g., 'primeng', 'clarity').
+                       Maps to design_systems/{design_system}.json
+
+    Returns:
+        Parsed JSON config dict, or None if not found.
+    """
+    config_path = os.path.join(Config.DS_MAPPINGS_DIR, f"{design_system}.json")
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            return json.load(f)
+    return None
+
+
+def build_common_mappings_prompt(ds_config: Dict[str, Any]) -> str:
+    """Build the 'Common mappings' section for the map_to_design_system_node prompt."""
+    lines = ["Common mappings:"]
+    for m in ds_config["common_mappings"]:
+        lines.append(f"- {m['semantic']} \u2192 {m['selectors']}")
+    return "\n".join(lines)
+
+
+def build_code_gen_mappings_prompt(ds_config: Dict[str, Any]) -> str:
+    """Build the component mapping guide section for the generate_angular_code_node prompt."""
+    name = ds_config["name"]
+    lines = [f"{name.upper()} COMPONENT MAPPING GUIDE - Use these aggressively:"]
+    for m in ds_config["code_gen_mappings"]:
+        lines.append(f"- {m['semantic']} \u2192 {m['usage']}")
+    return "\n".join(lines)
+
+
+def build_import_example_prompt(ds_config: Dict[str, Any]) -> str:
+    """Build the import example section for the code generation prompt."""
+    example = ds_config.get("component_example", {})
+    imports_example = example.get("imports_example", "// Import design system modules as needed")
+    decorator_imports = example.get("decorator_imports", "CommonModule, ...")
+    return f"""```typescript
+import {{ Component, ChangeDetectionStrategy }} from '@angular/core';
+import {{ CommonModule }} from '@angular/common';
+// Import ALL {ds_config['name']} modules that you use in the template
+{imports_example}
+// ... etc for every {ds_config.get('prefix', 'ds')}-* element used
+
+@Component({{
+  selector: 'app-component-name',
+  standalone: true,
+  imports: [{decorator_imports}],
+  templateUrl: './component-name.component.html',
+  styleUrls: ['./component-name.component.scss'],
+  changeDetection: ChangeDetectionStrategy.OnPush
+}})
+export class ComponentNameComponent {{ }}
+```"""
+
+
+def bootstrap_ds_mappings(
+    ds_json: Dict[str, Any],
+    ds_name: str,
+    save: bool = True
+) -> Dict[str, Any]:
+    """Auto-generate a design system mapping JSON from its documentation using LLM.
+
+    Use this when you don't have a pre-built mapping file for a design system.
+    It reads the component documentation and generates the mapping config.
+
+    Args:
+        ds_json: The Compodoc / documentation JSON for the design system.
+        ds_name: Human-readable name (e.g., 'PrimeNG', 'Clarity').
+        save: If True, saves the generated config to design_systems/ directory.
+
+    Returns:
+        The generated design system config dict.
+    """
+    # Extract component summaries from the documentation
+    catalog = _parse_compodoc_json(ds_json)
+    components_summary = []
+    for selector, info in list(catalog.get("components", {}).items())[:80]:
+        components_summary.append({
+            "selector": selector,
+            "name": info.get("name", ""),
+            "description": info.get("description", "")[:150],
+            "inputs": list(info.get("inputs", {}).keys())[:10]
+        })
+    for selector, info in list(catalog.get("directives", {}).items())[:40]:
+        components_summary.append({
+            "selector": selector,
+            "name": info.get("name", ""),
+            "description": info.get("description", "")[:150],
+            "inputs": list(info.get("inputs", {}).keys())[:10],
+            "type": "directive"
+        })
+
+    prompt = f"""You are given the component catalog for the "{ds_name}" UI library.
+Here are the available components and directives:
+
+{json.dumps(components_summary, indent=2)}
+
+Generate a JSON design system mapping config with EXACTLY this structure:
+{{
+  "name": "{ds_name}",
+  "framework": "angular",
+  "prefix": "<the component selector prefix used by this library, inferred from the selectors above>",
+  "common_mappings": [
+    {{ "semantic": "<semantic UI concept like button, card, input, etc.>", "selectors": "<actual selectors/usage from this library>" }}
+  ],
+  "code_gen_mappings": [
+    {{ "semantic": "<UI concept description like 'Buttons', 'Data tables'>", "usage": "<recommended usage pattern with proper elements and attributes>" }}
+  ],
+  "import_pattern": "<import statement pattern for this library>",
+  "component_example": {{
+    "imports_example": "<2-3 example import lines for this library>",
+    "decorator_imports": "<example imports array content for @Component decorator>"
+  }}
+}}
+
+RULES:
+- Only include mappings for components that ACTUALLY EXIST in the provided catalog
+- Cover all semantic UI concepts: text, button, input, card, container, list, icon, image, toolbar,
+  divider, chip, tab, menu, form-field, select, checkbox, radio, toggle, slider, progress,
+  stepper, table, expansion, dialog, tooltip, paginator, sidenav, datepicker, autocomplete, nav
+- Skip any semantic concept that has no matching component in this library
+- Use the EXACT selectors from the catalog
+- Output ONLY valid JSON, no markdown fences or explanation"""
+
+    llm = ChatOpenAI(
+        model=Config.LLM_MODEL,
+        temperature=0.1,
+        api_key=Config.OPENAI_API_KEY
+    )
+
+    response = llm.invoke([
+        SystemMessage(content="You generate structured JSON configs. Output ONLY valid JSON."),
+        HumanMessage(content=prompt)
+    ])
+
+    # Parse the response
+    content = response.content.strip()
+    # Strip markdown fences if present
+    if content.startswith("```"):
+        content = content.split("\n", 1)[1]
+        content = content.rsplit("```", 1)[0]
+
+    ds_config = json.loads(content)
+
+    # Save to file if requested
+    if save:
+        os.makedirs(Config.DS_MAPPINGS_DIR, exist_ok=True)
+        filename = ds_name.lower().replace(" ", "_").replace("-", "_")
+        config_path = os.path.join(Config.DS_MAPPINGS_DIR, f"{filename}.json")
+        with open(config_path, "w") as f:
+            json.dump(ds_config, f, indent=2)
+        print(f"Design system mapping saved to: {config_path}")
+
+    return ds_config
 
 
 # ============================================================================
@@ -342,6 +507,7 @@ class AgentState(TypedDict):
     figma_json: Dict[str, Any]
     original_figma_json: Optional[Dict[str, Any]]  # Original with thumbnailUrl
     ds_catalog: Dict[str, Any]
+    ds_config: Optional[Dict[str, Any]]  # Design system mapping config (from design_systems/*.json)
     design_tokens: Optional[Dict[str, Any]]
     figma_screenshots: Optional[Dict[str, str]]
     ir_tree: Optional[List[IRNode]]
@@ -1090,65 +1256,40 @@ def map_to_design_system_node(state: AgentState) -> AgentState:
     chunks = _chunk_nodes(flat_ir_nodes, Config.MAX_NODES_PER_CHUNK)
     all_mappings = []
 
-    system_prompt = """You are mapping UI elements to Angular Material design system components.
+    # Build mapping hints from design system config
+    ds_config = state.get("ds_config")
+    ds_name = ds_config["name"] if ds_config else "the design system"
+    common_mappings_section = build_common_mappings_prompt(ds_config) if ds_config else ""
+
+    system_prompt = f"""You are mapping UI elements to {ds_name} design system components.
 
 Available Design System Components (partial list):
-{ds_summary}
+{{ds_summary}}
 
 For each IR node:
 1. Identify the best matching DS component based on the node's semantic type
 2. Use the tools to explore available components and their APIs
 3. Map the IR node properties to component inputs
 
-IMPORTANT: Always prefer Angular Material components over raw HTML elements.
-Every UI element should be mapped to a Material component when possible.
+IMPORTANT: Always prefer {ds_name} components over raw HTML elements.
+Every UI element should be mapped to a {ds_name} component when possible.
 
-Common mappings:
-- text → <span>, <p>, <h1-h6>, or mat-card-title/mat-card-content
-- button → <button mat-button>, <button mat-raised-button>, <button mat-flat-button>, <button mat-fab>, <button mat-mini-fab>, <button mat-icon-button>
-- input → <input matInput> inside <mat-form-field>
-- card → <mat-card> with <mat-card-header>, <mat-card-content>, <mat-card-actions>
-- container → <div> with layout classes, or <mat-card> for sections, <mat-sidenav-container> for layouts
-- list → <mat-list>, <mat-nav-list>, <mat-selection-list>
-- icon → <mat-icon>
-- image → <img>
-- toolbar/header → <mat-toolbar>
-- divider/separator → <mat-divider>
-- chip/tag/badge → <mat-chip-listbox> with <mat-chip>, or matBadge directive
-- tab → <mat-tab-group> with <mat-tab>
-- menu/dropdown → <mat-menu> with mat-menu-item
-- form-field → <mat-form-field> wrapping matInput, mat-select, etc.
-- select/dropdown → <mat-select> with <mat-option>
-- checkbox → <mat-checkbox>
-- radio → <mat-radio-group> with <mat-radio-button>
-- toggle/switch → <mat-slide-toggle>
-- slider → <mat-slider>
-- progress/loading → <mat-progress-bar> or <mat-progress-spinner>
-- stepper/wizard → <mat-stepper> with <mat-step>
-- table/grid → <mat-table> or <table mat-table>
-- expansion/accordion → <mat-accordion> with <mat-expansion-panel>
-- dialog/modal → MatDialog service
-- tooltip → matTooltip directive
-- paginator → <mat-paginator>
-- sidenav/drawer → <mat-sidenav> inside <mat-sidenav-container>
-- datepicker → <mat-datepicker> with <input matInput>
-- autocomplete → <mat-autocomplete>
-- nav → <mat-nav-list> or <nav mat-tab-nav-bar>
+{common_mappings_section}
 
 Output JSON array of mappings. Example:
 [
   {{
     "figma_node_id": "1:2",
-    "ds_component": "MatButton",
-    "ds_selector": "button[mat-raised-button]",
-    "inputs": {{"color": "primary"}},
+    "ds_component": "<ComponentName>",
+    "ds_selector": "<component-selector>",
+    "inputs": {{"variant": "primary"}},
     "outputs": {{}},
     "children_slot": null
   }},
   {{
     "figma_node_id": "1:3",
-    "ds_component": "MatCard",
-    "ds_selector": "mat-card",
+    "ds_component": "<AnotherComponent>",
+    "ds_selector": "<another-selector>",
     "inputs": {{}},
     "outputs": {{}},
     "children_slot": "ng-content"
@@ -1158,7 +1299,7 @@ Output JSON array of mappings. Example:
 IMPORTANT:
 - Map ALL input nodes
 - Output ONLY valid JSON array at the end, no markdown or explanation
-- Use correct Angular Material selectors"""
+- Use correct {ds_name} selectors"""
 
     for i, chunk in enumerate(chunks):
         print(f"Mapping chunk {i+1}/{len(chunks)} ({len(chunk)} nodes)...")
@@ -1536,14 +1677,21 @@ def generate_angular_code_node(state: AgentState) -> AgentState:
         if screenshot_styling:
             print(f"Screenshot styling analysis: {json.dumps(screenshot_styling, indent=2)[:500]}...")
 
-    system_prompt = """You are an expert Angular developer. Generate a complete Angular component from a Figma design.
+    # Build dynamic prompt sections from design system config
+    ds_config = state.get("ds_config")
+    ds_name = ds_config["name"] if ds_config else "the design system"
+    ds_prefix = ds_config.get("prefix", "ds") if ds_config else "ds"
+    code_gen_mappings_section = build_code_gen_mappings_prompt(ds_config) if ds_config else ""
+    import_example_section = build_import_example_prompt(ds_config) if ds_config else ""
+
+    system_prompt = f"""You are an expert Angular developer. Generate a complete Angular component from a Figma design.
 
 CRITICAL INSTRUCTIONS:
 1. Analyze the design structure carefully - it contains the EXACT layout and content from Figma
 2. Generate code that MATCHES this specific design - NOT generic placeholder code
 3. Every text node in the design should appear in your HTML template
 4. Every container/frame should be represented with proper flexbox/grid layout
-5. **MAXIMIZE Angular Material component usage** - prefer Material components over raw HTML in every case
+5. **MAXIMIZE {ds_name} component usage** - prefer {ds_name} components over raw HTML in every case
 
 The design structure contains:
 - name: The Figma layer name (DO NOT use as display text — names like "Button", "Base", "Frame" are internal Figma layer names)
@@ -1560,83 +1708,34 @@ CRITICAL TEXT RULES:
 - NEVER use the node "name" as display text — names like "Button", "Base", "Frame 1037" are Figma layer names, NOT user-visible text
 - Actual display text comes ONLY from "text" or "innerText" fields
 
-ANGULAR MATERIAL COMPONENT MAPPING GUIDE - Use these aggressively:
-- Sections/cards/panels → <mat-card> with <mat-card-header>, <mat-card-content>, <mat-card-actions>
-- Headers/toolbars/top bars → <mat-toolbar> with <mat-toolbar-row>
-- Navigation/nav bars → <nav mat-tab-nav-bar> or <mat-nav-list>
-- Lists of items → <mat-list> with <mat-list-item>
-- Buttons → <button mat-raised-button>, <button mat-flat-button>, <button mat-icon-button>, <button mat-fab>
-- Text inputs → <mat-form-field> with <input matInput>
-- Dropdowns/selects → <mat-form-field> with <mat-select> and <mat-option>
-- Checkboxes → <mat-checkbox>
-- Radio buttons → <mat-radio-group> with <mat-radio-button>
-- Toggles/switches → <mat-slide-toggle>
-- Sliders → <mat-slider>
-- Icons → <mat-icon>
-- Dividers/separators/lines → <mat-divider>
-- Chips/tags/badges → <mat-chip-listbox> with <mat-chip> or matBadge directive
-- Tabs → <mat-tab-group> with <mat-tab>
-- Menus/dropdowns → <mat-menu> with <button mat-menu-item>
-- Tables/data grids → <table mat-table> with matColumnDef
-- Expansion/accordion → <mat-accordion> with <mat-expansion-panel>
-- Progress indicators → <mat-progress-bar> or <mat-progress-spinner>
-- Steppers/wizards → <mat-stepper> with <mat-step>
-- Side navigation → <mat-sidenav-container> with <mat-sidenav>
-- Tooltips → matTooltip directive on elements
-- Date pickers → <mat-datepicker> inside <mat-form-field>
-- Autocomplete → <mat-autocomplete> inside <mat-form-field>
-- Paginator → <mat-paginator>
+{code_gen_mappings_section}
 
 GENERATE:
 
 1. TypeScript Component (standalone):
-```typescript
-import { Component, ChangeDetectionStrategy } from '@angular/core';
-import { CommonModule } from '@angular/common';
-// Import ALL Angular Material modules that you use in the template
-import { MatCardModule } from '@angular/material/card';
-import { MatToolbarModule } from '@angular/material/toolbar';
-import { MatIconModule } from '@angular/material/icon';
-// ... etc for every mat-* element used
-
-@Component({
-  selector: 'app-component-name',
-  standalone: true,
-  imports: [CommonModule, MatCardModule, MatToolbarModule, MatIconModule, ...],
-  templateUrl: './component-name.component.html',
-  styleUrls: ['./component-name.component.scss'],
-  changeDetection: ChangeDetectionStrategy.OnPush
-})
-export class ComponentNameComponent { }
-```
+{import_example_section}
 
 2. HTML Template - MUST include ALL text and structure from the design:
-- Use <mat-card> for ANY card-like or section frame
-- Use <mat-toolbar> for ANY header or top bar
-- Use <mat-list> for ANY list of similar items
-- Use <mat-divider> between sections or list items
-- Use <mat-icon> wherever icons or icon-like elements appear
-- Use <button mat-raised-button> or <button mat-flat-button> for buttons
-- Wrap text inputs in <mat-form-field> with <input matInput>
+- Use {ds_name} components for every UI element where a matching component exists
 - Include ALL text content from the design
-- Use flexbox containers with classes like "flex-row", "flex-column" only when no Material layout component fits
+- Use flexbox containers with classes like "flex-row", "flex-column" only when no {ds_name} layout component fits
 
 3. SCSS Styles:
-- .flex-row { display: flex; flex-direction: row; }
-- .flex-column { display: flex; flex-direction: column; }
+- .flex-row {{ display: flex; flex-direction: row; }}
+- .flex-column {{ display: flex; flex-direction: column; }}
 - Apply colors, gaps, padding from the design
 - Use proper spacing based on layout info
 
-4. ds_components_used: Populate this array with EVERY Angular Material component used in the template.
-   For each Material component, include: figma_node_id, ds_component name, ds_selector, inputs, outputs.
+4. ds_components_used: Populate this array with EVERY {ds_name} component used in the template.
+   For each component, include: figma_node_id, ds_component name, ds_selector, inputs, outputs.
 
 IMPORTANT:
 - DO NOT generate placeholder text like "Sample Component" or "This is a sample"
 - USE the ACTUAL text content from the design structure
 - PRESERVE the visual hierarchy exactly as shown in the design
 - Apply the EXACT styling from the style properties (padding, gap, colors, fonts)
-- MAXIMIZE Material component usage - every UI element should use a Material component if one exists for that purpose
-- The TypeScript file MUST import the module for every mat-* element used in the HTML"""
+- MAXIMIZE {ds_name} component usage - every UI element should use a {ds_name} component if one exists for that purpose
+- The TypeScript file MUST import the module for every {ds_prefix}-* element used in the HTML"""
 
     # Add screenshot styling instructions if available
     if screenshot_styling:
@@ -1660,22 +1759,16 @@ This visual analysis takes precedence for styling - use it to make the component
     if len(design_json) > Config.MAX_JSON_SIZE:
         design_json = json.dumps(design_structure)[:Config.MAX_JSON_SIZE]
 
-    # Build dynamic list of available Angular Material components from DS_CATALOG
-    available_material = []
-    for selector in DS_CATALOG.get("components", {}):
-        if "mat-" in selector or "mat" in selector.lower():
-            available_material.append(selector)
-    if not available_material:
-        # Fallback if catalog is empty
-        available_material = [
-            "mat-card", "mat-button", "mat-icon", "mat-form-field",
-            "mat-input", "mat-list", "mat-divider", "mat-toolbar",
-            "mat-checkbox", "mat-radio-button", "mat-select", "mat-slide-toggle",
-            "mat-slider", "mat-menu", "mat-tab-group", "mat-expansion-panel",
-            "mat-table", "mat-paginator", "mat-progress-bar", "mat-progress-spinner",
-            "mat-chip", "mat-badge", "mat-tooltip", "mat-stepper",
-            "mat-sidenav", "mat-datepicker", "mat-autocomplete", "mat-nav-list"
-        ]
+    # Build dynamic list of available DS components from DS_CATALOG
+    available_ds_components = list(DS_CATALOG.get("components", {}).keys())
+    if not available_ds_components:
+        # Fallback: extract selectors from ds_config code_gen_mappings if available
+        if ds_config:
+            available_ds_components = [m["usage"].split(">")[0].split("<")[-1].split()[0]
+                                       for m in ds_config.get("code_gen_mappings", [])
+                                       if "<" in m.get("usage", "")]
+        else:
+            available_ds_components = []
 
     # Build component hierarchy context from DS mappings (connects mapping step to generation)
     component_hierarchy = _build_component_hierarchy_context(ir_tree, mappings)
@@ -1685,7 +1778,7 @@ This visual analysis takes precedence for styling - use it to make the component
         "design_structure": design_structure,
         "component_hierarchy_with_ds_mappings": component_hierarchy,
         "mappings_count": len(mappings),
-        "available_angular_material": available_material
+        "available_ds_components": available_ds_components
     }
 
     # Add screenshot styling to context if available
@@ -1754,48 +1847,62 @@ def validate_node(state: AgentState) -> AgentState:
             message="No files were generated"
         ))
 
+    # Determine the DS prefix for validation from ds_config
+    ds_config = state.get("ds_config")
+    ds_prefix = ds_config.get("prefix", "") if ds_config else ""
+    ds_name = ds_config["name"] if ds_config else "the design system"
+
     # Validate basic file structure (non-blocking warnings only)
     warnings = []
-    for mapping in generated.ds_components_used:
-        # Check if selector looks valid (starts with mat- or is standard HTML)
-        selector = mapping.ds_selector
-        is_angular_material = selector.startswith("mat-") or "mat-" in selector or "[mat" in selector
-        is_standard_html = selector in ["div", "span", "p", "h1", "h2", "h3", "h4", "h5", "h6",
-                                         "button", "input", "img", "a", "ul", "li", "section",
-                                         "header", "footer", "nav", "main", "article"]
+    known_selectors = set(DS_CATALOG.get("components", {}).keys())
+    known_selectors.update(DS_CATALOG.get("directives", {}).keys())
+    standard_html = {"div", "span", "p", "h1", "h2", "h3", "h4", "h5", "h6",
+                     "button", "input", "img", "a", "ul", "li", "section",
+                     "header", "footer", "nav", "main", "article"}
 
-        if not is_angular_material and not is_standard_html:
-            # Just log as warning, don't block
+    for mapping in generated.ds_components_used:
+        selector = mapping.ds_selector
+        is_known_ds = selector in known_selectors or (ds_prefix and ds_prefix in selector)
+        is_standard_html = selector in standard_html
+
+        if not is_known_ds and not is_standard_html:
             warnings.append(f"Unknown selector: {selector}")
 
     if warnings:
         print(f"  Validation warnings: {warnings[:3]}")
 
-    # Check Angular Material usage rate in generated HTML
+    # Check design system component usage rate in generated HTML
     html_files = [f for f in generated.files if f.file_type in ("html", "template") or f.path.endswith(".html")]
     for html_file in html_files:
         content = html_file.content
-        mat_count = content.count("mat-") + content.count("matInput") + content.count("matTooltip") + content.count("matBadge")
-        # Count total HTML elements as a rough baseline
+        # Count DS component references using the prefix from config
+        ds_count = 0
+        if ds_prefix:
+            ds_count = content.count(f"{ds_prefix}-") + content.count(f"{ds_prefix}[") + content.count(f"[{ds_prefix}")
+        # Also count any known selectors from the catalog
+        for sel in list(known_selectors)[:50]:
+            if sel in content:
+                ds_count += content.count(sel)
+
         tag_count = content.count("<") - content.count("</") - content.count("<!--")
         tag_count = max(tag_count, 1)
-        mat_ratio = mat_count / tag_count
+        ds_ratio = ds_count / tag_count
 
-        print(f"  Material usage in {html_file.path}: {mat_count} mat-* references out of ~{tag_count} elements ({mat_ratio:.0%})")
+        print(f"  DS usage in {html_file.path}: {ds_count} {ds_name} references out of ~{tag_count} elements ({ds_ratio:.0%})")
 
-        if mat_count < 2 and tag_count > 5:
+        if ds_count < 2 and tag_count > 5:
             errors.append(ValidationError(
                 file_path=html_file.path,
-                error_type="low_material_usage",
-                message=f"Low Angular Material usage: only {mat_count} Material references found in {tag_count} elements. Use mat-card for sections, mat-toolbar for headers, mat-list for lists, mat-divider between sections, mat-icon for icons, mat-button for buttons."
+                error_type="low_ds_usage",
+                message=f"Low {ds_name} usage: only {ds_count} component references found in {tag_count} elements. Maximize {ds_name} component usage for all UI elements."
             ))
-            print(f"  WARNING: Low Material usage detected, will trigger repair")
+            print(f"  WARNING: Low {ds_name} usage detected, will trigger repair")
 
     # Check that ds_components_used is populated
     if not generated.ds_components_used and html_files:
         for html_file in html_files:
-            if "mat-" in html_file.content:
-                print(f"  WARNING: ds_components_used is empty but HTML contains mat-* elements")
+            if ds_prefix and ds_prefix in html_file.content:
+                print(f"  WARNING: ds_components_used is empty but HTML contains {ds_name} elements")
                 break
 
     # Only add critical errors that would prevent compilation
@@ -1847,6 +1954,17 @@ def repair_node(state: AgentState) -> AgentState:
         for f in state["generated"].files:
             current_files[f.path] = f.content
 
+    # Build repair hints from ds_config
+    ds_config = state.get("ds_config")
+    ds_name = ds_config["name"] if ds_config else "the design system"
+    repair_mapping_hints = ""
+    if ds_config:
+        repair_mapping_hints = f"\n\nIMPORTANT - MAXIMIZE {ds_name} component usage:\n"
+        for m in ds_config.get("code_gen_mappings", []):
+            repair_mapping_hints += f"- {m['semantic']} \u2192 {m['usage']}\n"
+        repair_mapping_hints += f"- Every {ds_name} module used in the template MUST be imported in the TypeScript file\n"
+        repair_mapping_hints += f"- Populate ds_components_used with ALL {ds_name} components used"
+
     repair_prompt = f"""Previous generation had errors:
 
 {errors_summary}
@@ -1859,20 +1977,7 @@ Current generated files:
 
 Fix ALL errors and regenerate complete Angular component code.
 Generate proper TypeScript, HTML template, and SCSS files.
-
-IMPORTANT - MAXIMIZE Angular Material component usage:
-- Use <mat-card> for sections and card-like containers
-- Use <mat-toolbar> for headers and top bars
-- Use <mat-list> with <mat-list-item> for lists
-- Use <mat-divider> between sections
-- Use <mat-icon> for icons
-- Use <button mat-raised-button> or <button mat-flat-button> for buttons
-- Use <mat-form-field> with <input matInput> for text inputs
-- Use <mat-select> for dropdowns
-- Use <mat-checkbox>, <mat-radio-button>, <mat-slide-toggle> for controls
-- Use <mat-tab-group> for tabs, <mat-expansion-panel> for expandable sections
-- Every Material module used in the template MUST be imported in the TypeScript file
-- Populate ds_components_used with ALL Material components used"""
+{repair_mapping_hints}"""
 
     try:
         repair_input_chars = len(repair_prompt)
@@ -1935,11 +2040,35 @@ def run_figma_to_angular(
     figma_json: Dict,
     ds_json: Dict,
     design_tokens: Optional[Dict] = None,
-    figma_screenshots: Optional[Dict[str, str]] = None
+    figma_screenshots: Optional[Dict[str, str]] = None,
+    design_system: str = ""
 ) -> GeneratedAngularArtifact:
-    """Main entry point"""
+    """Main entry point.
+
+    Args:
+        figma_json: The Figma design tree JSON.
+        ds_json: The Compodoc / documentation JSON for the design system.
+        design_tokens: Optional design tokens dict.
+        figma_screenshots: Optional dict of screenshot URLs.
+        design_system: Name of the design system mapping config file
+                       (without .json extension, e.g., 'primeng', 'clarity').
+                       If a matching file exists in design_systems/, it will be loaded.
+                       Otherwise, a new config will be auto-generated from ds_json using LLM.
+    """
     METRICS.reset()
     initialize_catalog(ds_json, design_tokens)
+
+    if not design_system:
+        raise ValueError("design_system parameter is required (e.g., 'primeng', 'clarity', 'my_ds')")
+
+    # Load or bootstrap design system mapping config
+    ds_config = load_ds_config(design_system)
+    if ds_config is None:
+        print(f"No mapping config found for '{design_system}', bootstrapping from documentation...")
+        ds_config = bootstrap_ds_mappings(ds_json, design_system, save=True)
+        print(f"Bootstrap complete. Config saved to design_systems/{design_system}.json")
+    else:
+        print(f"Loaded design system config: {ds_config['name']}")
 
     # Extract thumbnail URL from original Figma JSON before processing
     thumbnail_url = figma_json.get("thumbnailUrl")
@@ -1948,6 +2077,7 @@ def run_figma_to_angular(
         "figma_json": figma_json,
         "original_figma_json": figma_json,  # Keep original for thumbnail URL
         "ds_catalog": DS_CATALOG,
+        "ds_config": ds_config,
         "design_tokens": design_tokens,
         "figma_screenshots": figma_screenshots or ({"main": thumbnail_url} if thumbnail_url else None),
         "ir_tree": None,
