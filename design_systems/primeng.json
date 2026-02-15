@@ -1,0 +1,150 @@
+{
+  "name": "primeng",
+  "framework": "angular",
+  "prefix": "p-",
+  "common_mappings": [
+    {
+      "semantic": "button",
+      "selectors": "p-button"
+    },
+    {
+      "semantic": "card",
+      "selectors": "p-card"
+    },
+    {
+      "semantic": "input",
+      "selectors": "p-autoComplete, p-autocomplete, p-auto-complete"
+    },
+    {
+      "semantic": "icon",
+      "selectors": "[data-p-icon]"
+    },
+    {
+      "semantic": "divider",
+      "selectors": "p-divider"
+    },
+    {
+      "semantic": "chip",
+      "selectors": "p-chip"
+    },
+    {
+      "semantic": "tab",
+      "selectors": "p-accordion"
+    },
+    {
+      "semantic": "menu",
+      "selectors": "p-contextMenu, p-contextmenu, p-context-menu"
+    },
+    {
+      "semantic": "form-field",
+      "selectors": "p-floatlabel, p-floatLabel, p-float-label"
+    },
+    {
+      "semantic": "select",
+      "selectors": "p-cascadeSelect, p-cascadeselect, p-cascade-select"
+    },
+    {
+      "semantic": "checkbox",
+      "selectors": "p-checkbox, p-checkBox, p-check-box"
+    },
+    {
+      "semantic": "dialog",
+      "selectors": "p-dialog"
+    },
+    {
+      "semantic": "paginator",
+      "selectors": "p-dataView, p-dataview, p-data-view"
+    },
+    {
+      "semantic": "sidenav",
+      "selectors": "p-drawer"
+    },
+    {
+      "semantic": "datepicker",
+      "selectors": "p-datePicker, p-datepicker, p-date-picker"
+    },
+    {
+      "semantic": "autocomplete",
+      "selectors": "p-autoComplete, p-autocomplete, p-auto-complete"
+    },
+    {
+      "semantic": "nav",
+      "selectors": "p-breadcrumb"
+    }
+  ],
+  "code_gen_mappings": [
+    {
+      "semantic": "Buttons",
+      "usage": "<button p-button>Click</button>"
+    },
+    {
+      "semantic": "Cards",
+      "usage": "<p-card header=\"Header\" subheader=\"Subheader\"></p-card>"
+    },
+    {
+      "semantic": "Inputs",
+      "usage": "<input p-autoComplete>"
+    },
+    {
+      "semantic": "Icons",
+      "usage": "<i data-p-icon=\"home\"></i>"
+    },
+    {
+      "semantic": "Dividers",
+      "usage": "<p-divider></p-divider>"
+    },
+    {
+      "semantic": "Chips",
+      "usage": "<p-chip label=\"Chip\"></p-chip>"
+    },
+    {
+      "semantic": "Tabs",
+      "usage": "<p-accordion><p-accordion-panel header=\"Header\"></p-accordion-panel></p-accordion>"
+    },
+    {
+      "semantic": "Menus",
+      "usage": "<p-contextMenu [model]=\"items\"></p-contextMenu>"
+    },
+    {
+      "semantic": "Form Fields",
+      "usage": "<p-floatlabel><input type=\"text\"></p-floatlabel>"
+    },
+    {
+      "semantic": "Selects",
+      "usage": "<p-cascadeSelect [options]=\"options\"></p-cascadeSelect>"
+    },
+    {
+      "semantic": "Checkboxes",
+      "usage": "<p-checkbox></p-checkbox>"
+    },
+    {
+      "semantic": "Dialogs",
+      "usage": "<p-dialog header=\"Header\"></p-dialog>"
+    },
+    {
+      "semantic": "Paginators",
+      "usage": "<p-dataView [value]=\"data\"></p-dataView>"
+    },
+    {
+      "semantic": "Sidenavs",
+      "usage": "<p-drawer></p-drawer>"
+    },
+    {
+      "semantic": "Datepickers",
+      "usage": "<p-datePicker></p-datePicker>"
+    },
+    {
+      "semantic": "Autocompletes",
+      "usage": "<p-autoComplete></p-autoComplete>"
+    },
+    {
+      "semantic": "Navigation",
+      "usage": "<p-breadcrumb [model]=\"items\"></p-breadcrumb>"
+    }
+  ],
+  "import_pattern": "import { <component> } from 'primeng/<component>'",
+  "component_example": {
+    "imports_example": "import { ButtonModule } from 'primeng/button';\nimport { CardModule } from 'primeng/card';",
+    "decorator_imports": "imports: [ButtonModule, CardModule]"
+  }
+}

@@ -28,7 +28,7 @@ def main():
         figma_data = json.load(f)
         print(figma_data.keys())
 
-    with open("./documentation/documentation.json") as f:
+    with open(f"./documentation/{design_system}-documentation.json") as f:
         ds_data = json.load(f)
 
     # 2. Load optional inputs

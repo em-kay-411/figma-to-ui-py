@@ -3,30 +3,30 @@
 PIPELINE METRICS SUMMARY
 ============================================================
 Total LLM calls:        4
-Total input chars:      122,163
-Total output chars:     28,212
+Total input chars:      125,860
+Total output chars:     28,373
 
 Step Timings:
   ingest_figma                        0.00s
-  build_ir                           39.12s
-  map_to_ds                          28.76s
-  generate_code                      21.78s
+  build_ir                           19.83s
+  map_to_ds                          12.31s
+  generate_code                      15.68s
   validate                            0.00s
-  TOTAL                              89.66s
+  TOTAL                              47.82s
 
 Log Trace:
   [ingest_figma] Step started
   [ingest_figma] Step completed in 0.00s
   [build_ir] Step started
-  [build_ir] LLM call #1: 14877 in / 19036 out chars
-  [build_ir] Step completed in 39.12s
+  [build_ir] LLM call #1: 14877 in / 19350 out chars
+  [build_ir] Step completed in 19.83s
   [map_to_ds] Step started
-  [map_to_ds] LLM call #2: 26424 in / 0 out chars
-  [map_to_ds] LLM call #3: 36161 in / 5510 out chars
-  [map_to_ds] Step completed in 28.76s
+  [map_to_ds] LLM call #2: 24769 in / 0 out chars
+  [map_to_ds] LLM call #3: 34060 in / 5344 out chars
+  [map_to_ds] Step completed in 12.31s
   [generate_code] Step started
-  [generate_code] LLM call #4: 44701 in / 3666 out chars
-  [generate_code] Step completed in 21.78s
+  [generate_code] LLM call #4: 52154 in / 3679 out chars
+  [generate_code] Step completed in 15.68s
   [validate] Step started
   [validate] Step completed in 0.00s
 ============================================================
@@ -35,14 +35,14 @@ DETAILED LOG TRACE:
   [ingest_figma] Step started
   [ingest_figma] Step completed in 0.00s
   [build_ir] Step started
-  [build_ir] LLM call #1: 14877 in / 19036 out chars
-  [build_ir] Step completed in 39.12s
+  [build_ir] LLM call #1: 14877 in / 19350 out chars
+  [build_ir] Step completed in 19.83s
   [map_to_ds] Step started
-  [map_to_ds] LLM call #2: 26424 in / 0 out chars
-  [map_to_ds] LLM call #3: 36161 in / 5510 out chars
-  [map_to_ds] Step completed in 28.76s
+  [map_to_ds] LLM call #2: 24769 in / 0 out chars
+  [map_to_ds] LLM call #3: 34060 in / 5344 out chars
+  [map_to_ds] Step completed in 12.31s
   [generate_code] Step started
-  [generate_code] LLM call #4: 44701 in / 3666 out chars
-  [generate_code] Step completed in 21.78s
+  [generate_code] LLM call #4: 52154 in / 3679 out chars
+  [generate_code] Step completed in 15.68s
   [validate] Step started
   [validate] Step completed in 0.00s

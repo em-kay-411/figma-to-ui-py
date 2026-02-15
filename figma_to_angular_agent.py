@@ -1260,11 +1260,12 @@ def map_to_design_system_node(state: AgentState) -> AgentState:
     ds_config = state.get("ds_config")
     ds_name = ds_config["name"] if ds_config else "the design system"
     common_mappings_section = build_common_mappings_prompt(ds_config) if ds_config else ""
+    ds_summary_str = json.dumps(ds_components_summary[:50], indent=2)
 
     system_prompt = f"""You are mapping UI elements to {ds_name} design system components.
 
 Available Design System Components (partial list):
-{{ds_summary}}
+{ds_summary_str}
 
 For each IR node:
 1. Identify the best matching DS component based on the node's semantic type
@@ -1304,12 +1305,8 @@ IMPORTANT:
     for i, chunk in enumerate(chunks):
         print(f"Mapping chunk {i+1}/{len(chunks)} ({len(chunk)} nodes)...")
 
-        formatted_prompt = system_prompt.format(
-            ds_summary=json.dumps(ds_components_summary[:50], indent=2)  # First 50 components
-        )
-
         messages = [
-            SystemMessage(content=formatted_prompt),
+            SystemMessage(content=system_prompt),
             HumanMessage(content=f"Map these {len(chunk)} IR nodes to DS components:\n\n{json.dumps(chunk, indent=2)}")
         ]
 
