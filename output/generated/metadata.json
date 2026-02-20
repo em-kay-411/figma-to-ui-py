@@ -2,56 +2,18 @@
   "component_name": "GeneratedComponent",
   "ds_components_used": [
     {
-      "figma_node_id": "1:2417",
-      "ds_selector": "p-contextMenu, p-contextmenu, p-context-menu",
+      "figma_node_id": "1:2427",
+      "ds_selector": "p-button",
       "inputs": {}
     },
     {
-      "figma_node_id": "1:2418",
-      "ds_selector": "p-contextMenu, p-contextmenu, p-context-menu",
-      "inputs": {}
-    },
-    {
-      "figma_node_id": "1:2421",
-      "ds_selector": "p-contextMenu, p-contextmenu, p-context-menu",
-      "inputs": {}
-    },
-    {
-      "figma_node_id": "1:2422",
-      "ds_selector": "p-contextMenu, p-contextmenu, p-context-menu",
-      "inputs": {}
-    },
-    {
-      "figma_node_id": "1:2423",
-      "ds_selector": "p-contextMenu, p-contextmenu, p-context-menu",
-      "inputs": {}
-    },
-    {
-      "figma_node_id": "1:2424",
-      "ds_selector": "p-contextMenu, p-contextmenu, p-context-menu",
-      "inputs": {}
-    },
-    {
-      "figma_node_id": "1:2426",
-      "ds_selector": "p-contextMenu, p-contextmenu, p-context-menu",
-      "inputs": {}
-    },
-    {
-      "figma_node_id": "1:2432",
-      "ds_selector": "p-contextMenu, p-contextmenu, p-context-menu",
-      "inputs": {}
-    },
-    {
-      "figma_node_id": "1:2433",
-      "ds_selector": "p-contextMenu, p-contextmenu, p-context-menu",
+      "figma_node_id": "1:2428",
+      "ds_selector": "p-button",
       "inputs": {}
     }
   ],
   "imports": [
-    "CommonModule",
-    "ButtonModule",
-    "CardModule",
-    "ContextMenuModule"
+    "ButtonModule"
   ],
   "unresolved_nodes": []
 }

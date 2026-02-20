@@ -1,0 +1,287 @@
+{
+  "name": "PrimeNG",
+  "framework": "angular",
+  "prefix": "p-",
+  "import_path": "primeng",
+  "component_example": {
+    "imports_example": "import { ButtonModule } from 'primeng/button';\nimport { CardModule } from 'primeng/card';\nimport { InputTextModule } from 'primeng/inputtext';",
+    "decorator_imports": "ButtonModule, CardModule, InputTextModule, CommonModule"
+  },
+  "components": [
+    {
+      "name": "button",
+      "selector": "p-button",
+      "description": "Interactive button component with icon, label, and severity variants",
+      "figma_hints": ["button", "btn", "cta", "action", "submit", "primary", "secondary", "icon-btn"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/button",
+        "api":      "https://primeng.org/button#api"
+      }
+    },
+    {
+      "name": "card",
+      "selector": "p-card",
+      "description": "Container card with header, subheader, content, and footer",
+      "figma_hints": ["card", "tile", "panel", "feature-card", "info-card", "product-card"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/card",
+        "api":      "https://primeng.org/card#api"
+      }
+    },
+    {
+      "name": "inputtext",
+      "selector": "p-inputtext",
+      "description": "Text input field, also used with pInputText directive on native input",
+      "figma_hints": ["input", "text-field", "textfield", "form-control", "field", "search-box", "text-input"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/inputtext",
+        "api":      "https://primeng.org/inputtext#api"
+      }
+    },
+    {
+      "name": "autocomplete",
+      "selector": "p-autocomplete",
+      "description": "Autocomplete input with suggestions dropdown",
+      "figma_hints": ["autocomplete", "auto-complete", "search-input", "typeahead"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/autocomplete",
+        "api":      "https://primeng.org/autocomplete#api"
+      }
+    },
+    {
+      "name": "checkbox",
+      "selector": "p-checkbox",
+      "description": "Checkbox control for boolean or multi-selections",
+      "figma_hints": ["checkbox", "check-box", "check", "multi-select"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/checkbox",
+        "api":      "https://primeng.org/checkbox#api"
+      }
+    },
+    {
+      "name": "radiobutton",
+      "selector": "p-radiobutton",
+      "description": "Radio button for single selection within a group",
+      "figma_hints": ["radio", "radio-button", "radio-group", "option-select"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/radiobutton",
+        "api":      "https://primeng.org/radiobutton#api"
+      }
+    },
+    {
+      "name": "toggleswitch",
+      "selector": "p-toggleswitch",
+      "description": "Toggle switch for on/off boolean state",
+      "figma_hints": ["toggle", "switch", "slide-toggle", "on-off"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/toggleswitch",
+        "api":      "https://primeng.org/toggleswitch#api"
+      }
+    },
+    {
+      "name": "select",
+      "selector": "p-select",
+      "description": "Dropdown select component for choosing from a list",
+      "figma_hints": ["select", "dropdown", "combobox", "picker", "choice"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/select",
+        "api":      "https://primeng.org/select#api"
+      }
+    },
+    {
+      "name": "chip",
+      "selector": "p-chip",
+      "description": "Compact element representing an attribute, filter, or label",
+      "figma_hints": ["chip", "tag", "label-chip", "filter-chip", "pill"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/chip",
+        "api":      "https://primeng.org/chip#api"
+      }
+    },
+    {
+      "name": "badge",
+      "selector": "p-badge",
+      "description": "Small status indicator showing count or status",
+      "figma_hints": ["badge", "indicator", "count-badge", "notification-badge", "status-dot"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/badge",
+        "api":      "https://primeng.org/badge#api"
+      }
+    },
+    {
+      "name": "divider",
+      "selector": "p-divider",
+      "description": "Horizontal or vertical separator with optional label",
+      "figma_hints": ["divider", "separator", "rule", "hr", "line-separator"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME", "LINE"],
+      "urls": {
+        "overview": "https://primeng.org/divider",
+        "api":      "https://primeng.org/divider#api"
+      }
+    },
+    {
+      "name": "tabs",
+      "selector": "p-tabs",
+      "description": "Tabbed navigation for switching between views",
+      "figma_hints": ["tab", "tabs", "tabbar", "tab-group", "tab-view"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/tabs",
+        "api":      "https://primeng.org/tabs#api"
+      }
+    },
+    {
+      "name": "accordion",
+      "selector": "p-accordion",
+      "description": "Collapsible accordion panels for content grouping",
+      "figma_hints": ["accordion", "expansion", "collapse", "expand"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/accordion",
+        "api":      "https://primeng.org/accordion#api"
+      }
+    },
+    {
+      "name": "table",
+      "selector": "p-table",
+      "description": "Full-featured data table with sorting, filtering, and pagination",
+      "figma_hints": ["table", "data-table", "grid", "datagrid", "list-table"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/table",
+        "api":      "https://primeng.org/table#api"
+      }
+    },
+    {
+      "name": "dialog",
+      "selector": "p-dialog",
+      "description": "Modal dialog for focused user interaction",
+      "figma_hints": ["dialog", "modal", "popup", "overlay", "lightbox"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/dialog",
+        "api":      "https://primeng.org/dialog#api"
+      }
+    },
+    {
+      "name": "drawer",
+      "selector": "p-drawer",
+      "description": "Side panel / drawer that slides in from screen edge",
+      "figma_hints": ["drawer", "sidenav", "sidebar", "side-panel", "panel"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/drawer",
+        "api":      "https://primeng.org/drawer#api"
+      }
+    },
+    {
+      "name": "breadcrumb",
+      "selector": "p-breadcrumb",
+      "description": "Breadcrumb navigation for hierarchical path display",
+      "figma_hints": ["breadcrumb", "nav-trail", "crumbs", "path-nav"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/breadcrumb",
+        "api":      "https://primeng.org/breadcrumb#api"
+      }
+    },
+    {
+      "name": "menubar",
+      "selector": "p-menubar",
+      "description": "Horizontal menu bar with nested items",
+      "figma_hints": ["menubar", "navbar", "navigation-bar", "top-nav", "main-nav"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/menubar",
+        "api":      "https://primeng.org/menubar#api"
+      }
+    },
+    {
+      "name": "menu",
+      "selector": "p-menu",
+      "description": "Vertical menu list with items and optional submenus",
+      "figma_hints": ["menu", "context-menu", "dropdown-menu", "list-menu"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/menu",
+        "api":      "https://primeng.org/menu#api"
+      }
+    },
+    {
+      "name": "datepicker",
+      "selector": "p-datepicker",
+      "description": "Date picker / calendar input for date selection",
+      "figma_hints": ["datepicker", "date-picker", "calendar", "date-input"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/datepicker",
+        "api":      "https://primeng.org/datepicker#api"
+      }
+    },
+    {
+      "name": "slider",
+      "selector": "p-slider",
+      "description": "Range slider for selecting numeric values",
+      "figma_hints": ["slider", "range", "range-slider", "progress-slider"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/slider",
+        "api":      "https://primeng.org/slider#api"
+      }
+    },
+    {
+      "name": "progressbar",
+      "selector": "p-progressbar",
+      "description": "Progress bar indicating completion percentage",
+      "figma_hints": ["progress", "progress-bar", "progressbar", "loading-bar"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/progressbar",
+        "api":      "https://primeng.org/progressbar#api"
+      }
+    },
+    {
+      "name": "avatar",
+      "selector": "p-avatar",
+      "description": "User avatar with image, icon, or initials",
+      "figma_hints": ["avatar", "profile-pic", "user-avatar", "profile-image", "user-photo"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/avatar",
+        "api":      "https://primeng.org/avatar#api"
+      }
+    },
+    {
+      "name": "tag",
+      "selector": "p-tag",
+      "description": "Tag component for categorization labels with severity colors",
+      "figma_hints": ["tag", "label", "status-tag", "category-label"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/tag",
+        "api":      "https://primeng.org/tag#api"
+      }
+    },
+    {
+      "name": "floatlabel",
+      "selector": "p-floatlabel",
+      "description": "Floating label wrapper for form fields",
+      "figma_hints": ["floatlabel", "float-label", "form-field", "labeled-input"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://primeng.org/floatlabel",
+        "api":      "https://primeng.org/floatlabel#api"
+      }
+    }
+  ]
+}

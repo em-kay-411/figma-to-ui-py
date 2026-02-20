@@ -1,0 +1,179 @@
+{
+  "_comment": "Copy this file to design_systems/<name>_catalog.json and fill in the fields.",
+  "name": "MyDesignSystem",
+  "framework": "angular",
+  "prefix": "mds",
+  "import_path": "@company/mds",
+  "component_example": {
+    "imports_example": "import { MdsButtonModule } from '@company/mds/button';\nimport { MdsCardModule } from '@company/mds/card';",
+    "decorator_imports": "MdsButtonModule, MdsCardModule, CommonModule"
+  },
+  "components": [
+    {
+      "name": "button",
+      "selector": "mds-button",
+      "description": "Interactive button for user actions",
+      "figma_hints": ["button", "btn", "cta", "action", "submit", "primary", "secondary"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://docs.example.com/components/button/overview",
+        "api":      "https://docs.example.com/components/button/api",
+        "usage":    "https://docs.example.com/components/button/usage"
+      }
+    },
+    {
+      "name": "card",
+      "selector": "mds-card",
+      "description": "Container card with optional header, content, and footer slots",
+      "figma_hints": ["card", "tile", "panel", "container-card"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://docs.example.com/components/card/overview",
+        "api":      "https://docs.example.com/components/card/api"
+      }
+    },
+    {
+      "name": "input",
+      "selector": "mds-input",
+      "description": "Text input field with label and optional error message",
+      "figma_hints": ["input", "text-field", "textfield", "form-control", "field", "search"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://docs.example.com/components/input/overview",
+        "api":      "https://docs.example.com/components/input/api"
+      }
+    },
+    {
+      "name": "checkbox",
+      "selector": "mds-checkbox",
+      "description": "Checkbox control for boolean selections",
+      "figma_hints": ["checkbox", "check-box", "check"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://docs.example.com/components/checkbox/overview",
+        "api":      "https://docs.example.com/components/checkbox/api"
+      }
+    },
+    {
+      "name": "radio",
+      "selector": "mds-radio",
+      "description": "Radio button for single selection within a group",
+      "figma_hints": ["radio", "radio-button", "option"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://docs.example.com/components/radio/overview",
+        "api":      "https://docs.example.com/components/radio/api"
+      }
+    },
+    {
+      "name": "toggle",
+      "selector": "mds-toggle",
+      "description": "Toggle switch for on/off states",
+      "figma_hints": ["toggle", "switch", "slide-toggle"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://docs.example.com/components/toggle/overview",
+        "api":      "https://docs.example.com/components/toggle/api"
+      }
+    },
+    {
+      "name": "select",
+      "selector": "mds-select",
+      "description": "Dropdown select for choosing from a list of options",
+      "figma_hints": ["select", "dropdown", "combobox", "picker"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://docs.example.com/components/select/overview",
+        "api":      "https://docs.example.com/components/select/api"
+      }
+    },
+    {
+      "name": "chip",
+      "selector": "mds-chip",
+      "description": "Compact element representing an attribute, action, or filter",
+      "figma_hints": ["chip", "tag", "badge-chip", "filter-chip"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://docs.example.com/components/chip/overview",
+        "api":      "https://docs.example.com/components/chip/api"
+      }
+    },
+    {
+      "name": "badge",
+      "selector": "mds-badge",
+      "description": "Small status indicator or count overlay",
+      "figma_hints": ["badge", "indicator", "count", "notification-dot"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://docs.example.com/components/badge/overview",
+        "api":      "https://docs.example.com/components/badge/api"
+      }
+    },
+    {
+      "name": "icon",
+      "selector": "mds-icon",
+      "description": "Icon display component",
+      "figma_hints": ["icon", "ico", "glyph", "symbol"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "VECTOR", "FRAME"],
+      "urls": {
+        "overview": "https://docs.example.com/components/icon/overview",
+        "api":      "https://docs.example.com/components/icon/api"
+      }
+    },
+    {
+      "name": "avatar",
+      "selector": "mds-avatar",
+      "description": "User avatar with image or initials fallback",
+      "figma_hints": ["avatar", "profile", "user-icon", "profile-pic"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://docs.example.com/components/avatar/overview",
+        "api":      "https://docs.example.com/components/avatar/api"
+      }
+    },
+    {
+      "name": "divider",
+      "selector": "mds-divider",
+      "description": "Horizontal or vertical visual separator",
+      "figma_hints": ["divider", "separator", "rule", "hr"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME", "LINE"],
+      "urls": {
+        "overview": "https://docs.example.com/components/divider/overview",
+        "api":      "https://docs.example.com/components/divider/api"
+      }
+    },
+    {
+      "name": "tab",
+      "selector": "mds-tab",
+      "description": "Tabbed navigation for switching between views",
+      "figma_hints": ["tab", "tabs", "tabbar", "tab-group"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://docs.example.com/components/tab/overview",
+        "api":      "https://docs.example.com/components/tab/api"
+      }
+    },
+    {
+      "name": "table",
+      "selector": "mds-table",
+      "description": "Data table for displaying structured information",
+      "figma_hints": ["table", "grid", "data-grid", "datagrid"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://docs.example.com/components/table/overview",
+        "api":      "https://docs.example.com/components/table/api"
+      }
+    },
+    {
+      "name": "dialog",
+      "selector": "mds-dialog",
+      "description": "Modal dialog for focused user interaction",
+      "figma_hints": ["dialog", "modal", "popup", "overlay"],
+      "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
+      "urls": {
+        "overview": "https://docs.example.com/components/dialog/overview",
+        "api":      "https://docs.example.com/components/dialog/api"
+      }
+    }
+  ]
+}
