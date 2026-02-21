@@ -16,7 +16,8 @@ import requests
 import time
 from enum import Enum
 
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool as lc_tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 from pydantic import BaseModel, Field
@@ -622,6 +623,7 @@ class AgentState(TypedDict):
     validation_errors: List[ValidationError]
     repair_attempt: int
     messages: List[Any]
+    ds_knowledge: Optional[Dict[str, Any]]   # pre-built utility class knowledge
 
 
 # ============================================================================
@@ -630,6 +632,25 @@ class AgentState(TypedDict):
 
 DS_CATALOG: Dict = {}
 DESIGN_TOKENS: Dict = {}
+DOC_KNOWLEDGE: Dict = {}          # populated at startup from {name}_knowledge.json
+DS_CATALOG_ENTRY_MAP: Dict = {}   # {name_lower → entry, selector → entry} from catalog
+
+
+def load_ds_knowledge(design_system: str) -> Optional[Dict]:
+    """Load design_systems/{design_system}_knowledge.json — non-fatal if missing."""
+    path = os.path.join(Config.DS_MAPPINGS_DIR, f"{design_system}_knowledge.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            data = json.load(f)
+        n = sum(
+            len(e.get("classes", {}))
+            for sec in data.get("sections", {}).values()
+            for e in sec.values()
+        )
+        print(f"Loaded knowledge: {data.get('name')} ({n} utility classes)")
+        return data
+    print(f"No knowledge file: {path} (utility class lookup disabled)")
+    return None
 
 
 # ============================================================================
@@ -1341,6 +1362,310 @@ def _build_component_hierarchy_context(ir_tree: List[Dict], mappings: List,
 
 
 # ============================================================================
+# PHASE 1: UTILITY CLASS RESEARCH (tool-calling loop)
+# ============================================================================
+
+_PHASE1_TOOLS_LIST: List = []   # populated after tool definitions
+_MAX_TOOL_ITERATIONS = 10        # raised to cover both utility-class + component-docs research
+
+
+@lc_tool
+def search_doc_knowledge(query: str, section: str = "all") -> str:
+    """Search the design system's CSS utility class documentation.
+
+    Args:
+        query:   What to look for (e.g. 'flex layout', 'shadow', 'text color').
+        section: 'layout' | 'content' | 'utilities' | 'components' | 'all'
+
+    Returns: JSON of matching class groups.
+    """
+    if not DOC_KNOWLEDGE:
+        return json.dumps({"message": "No knowledge base loaded."})
+
+    query_lower = query.lower()
+    sections_map = DOC_KNOWLEDGE.get("sections", {})
+    if section != "all":
+        sections_map = {section: sections_map[section]} if section in sections_map else {}
+
+    results = {}
+    for sec_name, sec_data in sections_map.items():
+        for entry_key, entry_data in sec_data.items():
+            classes = entry_data.get("classes", {})
+            title_match = (
+                query_lower in entry_data.get("title", "").lower()
+                or query_lower in entry_key
+            )
+            matched_classes = {
+                cls: desc for cls, desc in classes.items()
+                if query_lower in cls.lower() or query_lower in desc.lower()
+            }
+            if title_match or matched_classes:
+                results[entry_key] = {
+                    "section": sec_name,
+                    "title": entry_data.get("title"),
+                    "url":   entry_data.get("url"),
+                    "classes": matched_classes or classes,
+                    "examples": entry_data.get("examples", [])[:2],
+                }
+
+    if not results:
+        return json.dumps({
+            "message": (
+                f"No matches for '{query}'. "
+                "Try: layout, spacing, color, shadow, flex, grid."
+            )
+        })
+    return json.dumps(results, indent=2)
+
+
+@lc_tool
+def fetch_doc_page(url: str) -> str:
+    """Fetch the text of a documentation page (cached, up to 8000 chars).
+
+    Use after search_doc_knowledge returns a URL you want to explore further.
+    """
+    try:
+        scraper = DocScraper()
+        return scraper.fetch(url, max_chars=8000)
+    except Exception as exc:
+        return f"Failed to fetch {url}: {exc}"
+
+
+@lc_tool
+def fetch_component_docs(component: str, doc_type: str = "api") -> str:
+    """Fetch documentation for a specific design system component.
+
+    Args:
+        component: Component name or selector (e.g., 'button', 'p-button', 'card').
+                   Case-insensitive lookup against the catalog.
+        doc_type:  Which page to fetch — 'overview' | 'api' | 'usage'
+                   (default: 'api').  Falls back to the next available URL type
+                   if the requested one is absent for this component.
+
+    Returns:
+        Plain text of the documentation page (cached, up to 8000 chars), or an
+        informative error message if the component or URL is not found.
+    """
+    if not DS_CATALOG_ENTRY_MAP:
+        return "Component catalog not loaded."
+
+    # Flexible lookup: try selector first, then name (both stored in the map)
+    key = component.strip().lower()
+    entry = DS_CATALOG_ENTRY_MAP.get(key)
+    if entry is None:
+        # Try stripping a common prefix (e.g. "p-button" → "button")
+        stripped = key.split("-", 1)[-1] if "-" in key else key
+        entry = DS_CATALOG_ENTRY_MAP.get(stripped)
+
+    if entry is None:
+        available = sorted(set(DS_CATALOG_ENTRY_MAP.keys()))
+        return (
+            f"Component '{component}' not found in catalog. "
+            f"Available: {', '.join(available[:20])}"
+        )
+
+    urls: Dict[str, str] = entry.get("urls", {})
+
+    # Try requested type, then fall back through the other two in priority order
+    fallback_order = ["api", "overview", "usage"]
+    candidates = [doc_type] + [t for t in fallback_order if t != doc_type]
+    chosen_type, chosen_url = None, None
+    for candidate in candidates:
+        if urls.get(candidate):
+            chosen_type, chosen_url = candidate, urls[candidate]
+            break
+
+    if not chosen_url:
+        return (
+            f"No URLs configured for component '{component}' in the catalog. "
+            f"Add urls.overview / urls.api / urls.usage entries."
+        )
+
+    if chosen_type != doc_type:
+        note = f"(Note: '{doc_type}' URL not set; returning '{chosen_type}' instead.) "
+    else:
+        note = ""
+
+    try:
+        scraper = DocScraper()
+        text = scraper.fetch(chosen_url, max_chars=8000)
+        if not text:
+            return f"{note}Fetched empty content from {chosen_url}"
+        return f"{note}# {entry.get('name', component)} — {chosen_type}\nSource: {chosen_url}\n\n{text}"
+    except Exception as exc:
+        return f"Failed to fetch {chosen_url}: {exc}"
+
+
+_PHASE1_TOOLS_LIST = [search_doc_knowledge, fetch_doc_page, fetch_component_docs]
+
+
+def _build_phase1_design_summary(ir_tree: List[Dict], max_items: int = 30) -> str:
+    """Build a compact (~20-40 line) design outline to drive Phase 1 class searches."""
+    lines: List[str] = []
+
+    def walk(node: Dict, depth: int = 0) -> None:
+        if len(lines) >= max_items:
+            return
+        t      = node.get("type", "?")
+        name   = node.get("name", "")
+        layout = node.get("layout", "")
+        styling = node.get("styling", {})
+        text   = (node.get("properties") or {}).get("text", "")
+        indent = "  " * depth
+        desc = f"{indent}- {t} [{name}]"
+        if text:
+            desc += f" text={text!r}"
+        if layout:
+            desc += f" layout={layout}"
+        if styling.get("effects"):
+            desc += " has-shadow"
+        if styling.get("fills"):
+            desc += " has-fill"
+        if styling.get("textStyle"):
+            desc += f" fs={styling['textStyle'].get('fontSize', '?')}"
+        lines.append(desc)
+        for child in node.get("children", []):
+            walk(child, depth + 1)
+
+    for n in ir_tree:
+        walk(n)
+    return "\n".join(lines) or "No IR tree available."
+
+
+def _run_utility_class_research_phase(
+    llm: Any,
+    design_summary: str,
+    ds_name: str,
+    mapped_components: Optional[List[str]] = None,
+) -> str:
+    """Phase 1: LLM calls tools to gather utility classes AND component docs.
+
+    Runs when either DOC_KNOWLEDGE is loaded (utility class research) or
+    DS_CATALOG_ENTRY_MAP is populated (component docs research).
+
+    Args:
+        llm:               ChatOpenAI instance (no tools bound yet).
+        design_summary:    Compact outline of the IR tree.
+        ds_name:           Human-readable design system name.
+        mapped_components: List of DS component names/selectors matched during
+                           the mapping step (non-native only).  Used to drive
+                           proactive component docs fetching.
+
+    Returns a plain-text context block to embed in the code-gen prompt,
+    or '' if there is nothing to research.
+    """
+    has_knowledge = bool(DOC_KNOWLEDGE)
+    has_components = bool(mapped_components and DS_CATALOG_ENTRY_MAP)
+    if not has_knowledge and not has_components:
+        return ""
+
+    tool_llm = llm.bind_tools(_PHASE1_TOOLS_LIST)
+
+    # Build the components list section for the prompt
+    if mapped_components:
+        components_list = "\n".join(f"  - {c}" for c in sorted(set(mapped_components)))
+        components_section = f"""
+PART B — COMPONENT DOCUMENTATION
+These {ds_name} components were matched to nodes in this design:
+{components_list}
+
+For EACH component above, call fetch_component_docs in this order:
+  1. fetch_component_docs("<name>", "api")      — inputs, outputs, selectors
+  2. fetch_component_docs("<name>", "usage")    — real usage examples
+  3. fetch_component_docs("<name>", "overview") — only if api+usage are unclear
+Skip doc types that won't add new information (e.g., if api already has examples).
+"""
+    else:
+        components_section = ""
+
+    utility_section = ""
+    if has_knowledge:
+        utility_section = """
+PART A — UTILITY CLASS RESEARCH
+Call search_doc_knowledge in this order (skip concerns absent from the design):
+  1. search_doc_knowledge("flex", "layout")
+  2. search_doc_knowledge("grid", "layout")          — only if design uses grid
+  3. search_doc_knowledge("gap spacing", "layout")
+  4. search_doc_knowledge("padding", "utilities")
+  5. search_doc_knowledge("shadow", "utilities")
+  6. search_doc_knowledge("background surface", "utilities")
+  7. search_doc_knowledge("text color", "utilities")
+  8. fetch_doc_page(url) only if a result needs deeper clarification
+"""
+
+    system_prompt = f"""You are a {ds_name} documentation researcher.
+
+TASK: Before the Angular component is generated, gather all information the
+developer needs to use {ds_name} correctly for the design described below.
+{utility_section}{components_section}
+FINAL OUTPUT — two clearly labelled sections:
+
+## Utility Classes
+(Only if Part A applies — omit section if no knowledge base loaded)
+- Layout: <classes and what they do>
+- Spacing: <classes>
+- Color/surface: <classes>
+- Shadow: <classes>
+- Typography: <classes>
+
+## Component APIs
+(One subsection per component)
+### <ComponentName> (<selector>)
+- Key inputs: <input>[type] — description
+- Usage example: <code snippet>
+- Severity/variant classes: <if applicable>
+
+RULES:
+- Only report classes/APIs you actually found via tool calls. Do NOT invent.
+- Be concise — the developer needs just enough to write correct code.
+- If a tool returns an error or empty result, note it briefly and move on.
+
+Design being implemented:
+{design_summary}"""
+
+    messages: List[Any] = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content="Research the documentation now, then provide your summary."),
+    ]
+
+    # Tool dispatcher map for clean routing
+    tool_dispatch = {
+        "search_doc_knowledge": search_doc_knowledge,
+        "fetch_doc_page":       fetch_doc_page,
+        "fetch_component_docs": fetch_component_docs,
+    }
+
+    for iteration in range(_MAX_TOOL_ITERATIONS):
+        response = tool_llm.invoke(messages)
+        messages.append(response)
+
+        if not response.tool_calls:
+            print(f"  Phase 1: done in {iteration + 1} iteration(s), "
+                  f"context={len(response.content)} chars")
+            return response.content
+
+        print(f"  Phase 1 iteration {iteration + 1}: "
+              f"{len(response.tool_calls)} tool call(s) "
+              f"({', '.join(tc['name'] for tc in response.tool_calls)})")
+
+        for tc in response.tool_calls:
+            tool_fn = tool_dispatch.get(tc["name"])
+            if tool_fn is not None:
+                result = tool_fn.invoke(tc["args"])
+            else:
+                result = f"Unknown tool: {tc['name']}"
+            messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+
+    # Hit iteration cap — use last AI message content
+    last = next(
+        (m.content for m in reversed(messages) if isinstance(m, AIMessage)),
+        "",
+    )
+    print(f"  Phase 1: hit max iterations, using last AI content ({len(last)} chars)")
+    return last
+
+
+# ============================================================================
 # STEP 4: GENERATE ANGULAR CODE
 # ============================================================================
 
@@ -1365,6 +1690,42 @@ def generate_angular_code_node(state: AgentState) -> AgentState:
 
     llm = ChatOpenAI(model=Config.LLM_MODEL, temperature=Config.LLM_TEMPERATURE)
     structured_llm = llm.with_structured_output(GeneratedAngularArtifact)
+
+    # ── Phase 1: utility class + component docs research ──────────────────
+    ds_config_pre = state.get("ds_config") or {}
+    ds_name_pre = ds_config_pre.get("name", "the design system")
+
+    # Collect non-native DS components matched in this design
+    matched_ds_components: List[str] = sorted({
+        (m.model_dump() if hasattr(m, "model_dump") else m)["ds_component"]
+        for m in mappings
+        if (m.model_dump() if hasattr(m, "model_dump") else m).get("ds_component", "native") != "native"
+    })
+
+    has_phase1_work = bool(DOC_KNOWLEDGE) or bool(matched_ds_components and DS_CATALOG_ENTRY_MAP)
+    utility_classes_context = ""
+    if has_phase1_work:
+        try:
+            METRICS.start_step("phase1_research")
+            design_summary = _build_phase1_design_summary(ir_tree)
+            print(f"Phase 1: researching utility classes + "
+                  f"{len(matched_ds_components)} component(s): "
+                  f"{', '.join(matched_ds_components) or 'none'}")
+            utility_classes_context = _run_utility_class_research_phase(
+                llm=llm,
+                design_summary=design_summary,
+                ds_name=ds_name_pre,
+                mapped_components=matched_ds_components if matched_ds_components else None,
+            )
+            METRICS.end_step("phase1_research")
+            METRICS.record_llm_call(
+                len(design_summary), len(utility_classes_context), "phase1_research"
+            )
+        except Exception as exc:
+            print(f"Warning: Phase 1 failed ({exc}), proceeding without utility context.")
+            utility_classes_context = ""
+    else:
+        print("Phase 1 skipped (no knowledge.json and no DS components mapped).")
 
     # Derive component name
     root_name = "GeneratedComponent"
@@ -1400,6 +1761,25 @@ def generate_angular_code_node(state: AgentState) -> AgentState:
     code_gen_mappings_section = build_catalog_code_gen_prompt(catalog) if catalog else ""
     import_example_section = build_catalog_import_example(catalog) if catalog else ""
 
+    # Build research context section for the prompt (Phase 1 output)
+    utility_classes_section = ""
+    if utility_classes_context:
+        utility_classes_section = f"""
+## {ds_name.upper()} DOCUMENTATION RESEARCH (Phase 1 findings)
+The following was gathered from the {ds_name} documentation before code generation.
+USE THIS INFORMATION to write correct, idiomatic {ds_name} code:
+
+{utility_classes_context}
+
+MANDATORY RULES:
+- Apply utility classes via the HTML `class` attribute FIRST; write SCSS only for styles
+  not covered by a utility class found above
+- Use component inputs/outputs EXACTLY as described in the Component APIs section above
+- Exact Figma pixel values with no matching utility class may remain in SCSS
+- Prefer `class="flex flex-column gap-3 p-4"` over custom SCSS that does the same thing
+- The SCSS file should shrink significantly — only truly bespoke styles remain
+"""
+
     system_prompt = f"""You are an expert Angular developer. Generate a complete Angular component from a Figma design.
 
 CRITICAL INSTRUCTIONS:
@@ -1432,7 +1812,7 @@ CRITICAL TEXT RULES:
 - The ds_selector field for text nodes contains the HTML tag (e.g., "h2", "p") — use it literally as the element tag
 
 {code_gen_mappings_section}
-
+{utility_classes_section}
 GENERATE:
 
 1. TypeScript Component (standalone):
@@ -1442,13 +1822,15 @@ GENERATE:
 - Use {ds_name} components for every UI element where a matching component exists
 - For ds_component="native" nodes: use the ds_selector value directly as the HTML tag
 - Include ALL text content from the design
-- Use flexbox containers with classes like "flex-row", "flex-column" only when no {ds_name} layout component fits
+- Use utility classes from the {ds_name} documentation (listed above) for layout, spacing, and color
+- Use flexbox fallback classes "flex-row"/"flex-column" ONLY if no {ds_name} layout utility class was found
 
 3. SCSS Styles:
-- .flex-row {{ display: flex; flex-direction: row; }}
-- .flex-column {{ display: flex; flex-direction: column; }}
-- Apply colors, gaps, padding from the design
-- Use proper spacing based on layout info
+- ONLY write SCSS for styles NOT already covered by the utility classes listed above
+- If a utility class exists for display:flex, gap, padding, color, shadow — use the class, not SCSS
+- You MAY still write custom SCSS for: exact pixel values with no utility match,
+  component-level overrides, hover states, specific widths/heights from Figma
+- .flex-row / .flex-column fallback definitions ONLY if no layout utility class was found
 
 4. ds_components_used: Populate this array with EVERY {ds_name} component used in the template.
    For each component, include: figma_node_id, ds_component name, ds_selector, inputs, outputs.
@@ -1772,7 +2154,7 @@ def run_figma_to_angular(
     """
     METRICS.reset()
 
-    global DESIGN_TOKENS, DS_CATALOG
+    global DESIGN_TOKENS, DS_CATALOG, DOC_KNOWLEDGE, DS_CATALOG_ENTRY_MAP
     DESIGN_TOKENS = design_tokens or {}
 
     if not design_system:
@@ -1787,6 +2169,17 @@ def run_figma_to_angular(
 
     DS_CATALOG = _build_ds_catalog_from_catalog(catalog)
     print(f"Loaded catalog: {catalog['name']} ({len(catalog.get('components', []))} components)")
+
+    # Build fast-lookup map: name (lowercase) + selector → catalog entry
+    DS_CATALOG_ENTRY_MAP = {}
+    for entry in catalog.get("components", []):
+        if entry.get("name"):
+            DS_CATALOG_ENTRY_MAP[entry["name"].lower()] = entry
+        if entry.get("selector"):
+            DS_CATALOG_ENTRY_MAP[entry["selector"].lower()] = entry
+
+    knowledge = load_ds_knowledge(design_system)
+    DOC_KNOWLEDGE = knowledge or {}
 
     # Build a ds_config-like dict from catalog metadata for downstream compatibility
     ds_config = {
@@ -1814,6 +2207,7 @@ def run_figma_to_angular(
         "validation_errors": [],
         "repair_attempt": 0,
         "messages": [],
+        "ds_knowledge": knowledge,
     }
 
     print("Invoking workflow...")

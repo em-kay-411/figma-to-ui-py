@@ -2,11 +2,35 @@
   "name": "PrimeNG",
   "framework": "angular",
   "prefix": "p-",
+  "base_url": "https://primeng.org",
   "import_path": "primeng",
   "component_example": {
     "imports_example": "import { ButtonModule } from 'primeng/button';\nimport { CardModule } from 'primeng/card';\nimport { InputTextModule } from 'primeng/inputtext';",
     "decorator_imports": "ButtonModule, CardModule, InputTextModule, CommonModule"
   },
+
+  "layout": [
+    { "title": "Flexbox",    "url": "" },
+    { "title": "Grid",       "url": "" },
+    { "title": "Display",    "url": "" },
+    { "title": "Spacing",    "url": "" },
+    { "title": "Containers", "url": "" }
+  ],
+
+  "content": [
+    { "title": "Typography", "url": "" },
+    { "title": "Images",     "url": "" }
+  ],
+
+  "utilities": [
+    { "title": "Colors",     "url": "" },
+    { "title": "Shadows",    "url": "" },
+    { "title": "Spacing",    "url": "" },
+    { "title": "Text",       "url": "" },
+    { "title": "Surfaces",   "url": "" },
+    { "title": "Borders",    "url": "" }
+  ],
+
   "components": [
     {
       "name": "button",
@@ -16,7 +40,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/button",
-        "api":      "https://primeng.org/button#api"
+        "api":      "https://primeng.org/button#api",
+        "usage":    ""
       }
     },
     {
@@ -27,7 +52,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/card",
-        "api":      "https://primeng.org/card#api"
+        "api":      "https://primeng.org/card#api",
+        "usage":    ""
       }
     },
     {
@@ -38,7 +64,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/inputtext",
-        "api":      "https://primeng.org/inputtext#api"
+        "api":      "https://primeng.org/inputtext#api",
+        "usage":    ""
       }
     },
     {
@@ -49,7 +76,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/autocomplete",
-        "api":      "https://primeng.org/autocomplete#api"
+        "api":      "https://primeng.org/autocomplete#api",
+        "usage":    ""
       }
     },
     {
@@ -60,7 +88,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/checkbox",
-        "api":      "https://primeng.org/checkbox#api"
+        "api":      "https://primeng.org/checkbox#api",
+        "usage":    ""
       }
     },
     {
@@ -71,7 +100,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/radiobutton",
-        "api":      "https://primeng.org/radiobutton#api"
+        "api":      "https://primeng.org/radiobutton#api",
+        "usage":    ""
       }
     },
     {
@@ -82,7 +112,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/toggleswitch",
-        "api":      "https://primeng.org/toggleswitch#api"
+        "api":      "https://primeng.org/toggleswitch#api",
+        "usage":    ""
       }
     },
     {
@@ -93,7 +124,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/select",
-        "api":      "https://primeng.org/select#api"
+        "api":      "https://primeng.org/select#api",
+        "usage":    ""
       }
     },
     {
@@ -104,7 +136,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/chip",
-        "api":      "https://primeng.org/chip#api"
+        "api":      "https://primeng.org/chip#api",
+        "usage":    ""
       }
     },
     {
@@ -115,7 +148,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/badge",
-        "api":      "https://primeng.org/badge#api"
+        "api":      "https://primeng.org/badge#api",
+        "usage":    ""
       }
     },
     {
@@ -126,7 +160,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME", "LINE"],
       "urls": {
         "overview": "https://primeng.org/divider",
-        "api":      "https://primeng.org/divider#api"
+        "api":      "https://primeng.org/divider#api",
+        "usage":    ""
       }
     },
     {
@@ -137,7 +172,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/tabs",
-        "api":      "https://primeng.org/tabs#api"
+        "api":      "https://primeng.org/tabs#api",
+        "usage":    ""
       }
     },
     {
@@ -148,7 +184,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/accordion",
-        "api":      "https://primeng.org/accordion#api"
+        "api":      "https://primeng.org/accordion#api",
+        "usage":    ""
       }
     },
     {
@@ -159,7 +196,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/table",
-        "api":      "https://primeng.org/table#api"
+        "api":      "https://primeng.org/table#api",
+        "usage":    ""
       }
     },
     {
@@ -170,7 +208,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/dialog",
-        "api":      "https://primeng.org/dialog#api"
+        "api":      "https://primeng.org/dialog#api",
+        "usage":    ""
       }
     },
     {
@@ -181,7 +220,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/drawer",
-        "api":      "https://primeng.org/drawer#api"
+        "api":      "https://primeng.org/drawer#api",
+        "usage":    ""
       }
     },
     {
@@ -192,7 +232,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/breadcrumb",
-        "api":      "https://primeng.org/breadcrumb#api"
+        "api":      "https://primeng.org/breadcrumb#api",
+        "usage":    ""
       }
     },
     {
@@ -203,7 +244,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/menubar",
-        "api":      "https://primeng.org/menubar#api"
+        "api":      "https://primeng.org/menubar#api",
+        "usage":    ""
       }
     },
     {
@@ -214,7 +256,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/menu",
-        "api":      "https://primeng.org/menu#api"
+        "api":      "https://primeng.org/menu#api",
+        "usage":    ""
       }
     },
     {
@@ -225,7 +268,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/datepicker",
-        "api":      "https://primeng.org/datepicker#api"
+        "api":      "https://primeng.org/datepicker#api",
+        "usage":    ""
       }
     },
     {
@@ -236,7 +280,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/slider",
-        "api":      "https://primeng.org/slider#api"
+        "api":      "https://primeng.org/slider#api",
+        "usage":    ""
       }
     },
     {
@@ -247,7 +292,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/progressbar",
-        "api":      "https://primeng.org/progressbar#api"
+        "api":      "https://primeng.org/progressbar#api",
+        "usage":    ""
       }
     },
     {
@@ -258,7 +304,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/avatar",
-        "api":      "https://primeng.org/avatar#api"
+        "api":      "https://primeng.org/avatar#api",
+        "usage":    ""
       }
     },
     {
@@ -269,7 +316,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/tag",
-        "api":      "https://primeng.org/tag#api"
+        "api":      "https://primeng.org/tag#api",
+        "usage":    ""
       }
     },
     {
@@ -280,7 +328,8 @@
       "figma_node_types": ["INSTANCE", "COMPONENT", "FRAME"],
       "urls": {
         "overview": "https://primeng.org/floatlabel",
-        "api":      "https://primeng.org/floatlabel#api"
+        "api":      "https://primeng.org/floatlabel#api",
+        "usage":    ""
       }
     }
   ]
