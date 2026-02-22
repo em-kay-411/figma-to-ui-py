@@ -4,3 +4,6 @@ langchain-anthropic
 langgraph
 pydantic
 python-dotenv
+selenium
+html2text
+beautifulsoup4

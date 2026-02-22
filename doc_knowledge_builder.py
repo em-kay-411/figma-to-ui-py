@@ -1,17 +1,22 @@
 """
-doc_knowledge_builder.py — One-time CLI tool to scrape DS documentation pages
-and extract CSS utility class knowledge into a structured JSON file.
+doc_knowledge_builder.py — One-time CLI tool to build CSS utility class knowledge.
 
 Usage:
     python doc_knowledge_builder.py <design_system>
 
-Reads:  design_systems/{design_system}_catalog.json
-        (sections: layout, content, utilities — each entry has title + url)
+Reads:  design_systems/{design_system}_catalog.json  (layout/content/utilities sections)
+        design_systems/{design_system}_docs/          (preferred — local .md files from
+                                                       scrape_ds_docs.py; no network needed)
 Writes: design_systems/{design_system}_knowledge.json
 
-NOTE: Only the `layout`, `content`, and `utilities` sections are scraped.
+Source priority for each doc page:
+  1. Local .md file at design_systems/{name}_docs/{section}/{slug}.md
+     (produced by scrape_ds_docs.py — handles JS-rendered sites)
+  2. URL fetch via DocScraper (fallback when no local file exists)
+
+NOTE: Only the `layout`, `content`, and `utilities` sections are processed.
 The `components` section contains component *definitions* (not CSS class pages)
-and is handled separately by the pipeline at runtime via fetch_component_docs().
+and is handled at runtime via fetch_component_docs() which also prefers local files.
 
 The knowledge file is consumed at runtime by figma_to_angular_agent.py (Phase 1
 utility class research) to let the code-gen LLM use DS utility classes instead
@@ -141,32 +146,60 @@ def _extract_classes_from_page(
         return {"classes": {}, "examples": []}
 
 
+def _url_to_slug(url: str, title: str) -> str:
+    """Derive a slug from a URL — must match the logic in scrape_ds_docs.py."""
+    import re
+    slug = url.rstrip("/").rsplit("/", 1)[-1] if url else ""
+    slug = slug.split("#")[0]
+    slug = slug or title.lower().replace(" ", "-")
+    slug = re.sub(r"[^\w\-]", "", slug)
+    return slug or "page"
+
+
+def _read_local_page(design_system: str, section_name: str, slug: str) -> Optional[str]:
+    """Return content of the local .md file if it exists, else None."""
+    path = os.path.join(DS_DIR, f"{design_system}_docs", section_name, f"{slug}.md")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    return None
+
+
 def _process_section(
     scraper: DocScraper,
     llm: ChatOpenAI,
     section_name: str,
     entries: List[Dict],
+    design_system: str = "",
 ) -> Dict[str, Any]:
-    """Scrape + extract classes for all pages in one section.
+    """Read + extract CSS classes for all pages in one section.
 
-    Returns a dict keyed by a URL-derived slug for each page entry.
+    For each entry, checks for a local .md file first (from scrape_ds_docs.py).
+    Falls back to URL fetch via DocScraper if no local file exists.
+
+    Returns a dict keyed by URL-derived slug for each page entry.
     """
     section_data: Dict[str, Any] = {}
 
     for entry in entries:
         title = entry.get("title", "Untitled")
-        url = entry.get("url", "")
-        if not url:
-            print(f"  Skipping '{title}' — no URL")
+        url   = entry.get("url", "").strip()
+        slug  = _url_to_slug(url, title)
+
+        # ── Prefer local .md file (produced by scrape_ds_docs.py) ────
+        local_text = _read_local_page(design_system, section_name, slug) if design_system else None
+
+        if local_text:
+            print(f"  [{section_name}] '{title}': reading local file")
+            page_text = local_text
+        elif url:
+            print(f"  [{section_name}] '{title}': fetching {url}")
+            page_text = scraper.fetch(url, max_chars=MAX_CHARS_PER_PAGE)
+        else:
+            print(f"  Skipping '{title}' — no local file and no URL")
             continue
 
-        # Derive a slug from the URL path (last non-empty segment)
-        slug = url.rstrip("/").rsplit("/", 1)[-1] or title.lower().replace(" ", "-")
-
-        print(f"  [{section_name}] {title} → {url}")
-        scraped_text = scraper.fetch(url, max_chars=MAX_CHARS_PER_PAGE)
-
-        extracted = _extract_classes_from_page(llm, title, scraped_text)
+        extracted = _extract_classes_from_page(llm, title, page_text)
         time.sleep(SLEEP_BETWEEN_CALLS)
 
         section_data[slug] = {
@@ -213,7 +246,7 @@ def build_knowledge(design_system: str) -> None:
             continue
 
         print(f"\nProcessing section: {section_name} ({len(entries)} page(s))")
-        section_data = _process_section(scraper, llm, section_name, entries)
+        section_data = _process_section(scraper, llm, section_name, entries, design_system)
         knowledge_sections[section_name] = section_data
 
         section_classes = sum(len(v.get("classes", {})) for v in section_data.values())

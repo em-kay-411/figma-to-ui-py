@@ -634,6 +634,7 @@ DS_CATALOG: Dict = {}
 DESIGN_TOKENS: Dict = {}
 DOC_KNOWLEDGE: Dict = {}          # populated at startup from {name}_knowledge.json
 DS_CATALOG_ENTRY_MAP: Dict = {}   # {name_lower → entry, selector → entry} from catalog
+DS_DOCS_DIR: str = ""             # path to design_systems/{name}_docs/ if it exists
 
 
 def load_ds_knowledge(design_system: str) -> Optional[Dict]:
@@ -1486,12 +1487,27 @@ def fetch_component_docs(component: str, doc_type: str = "api") -> str:
     else:
         note = ""
 
+    comp_name = entry.get("name", component)
+
+    # ── Prefer local .md file produced by scrape_ds_docs.py ──────────────────
+    if DS_DOCS_DIR:
+        local_path = os.path.join(DS_DOCS_DIR, "components", f"{comp_name}.md")
+        if os.path.exists(local_path):
+            try:
+                with open(local_path, encoding="utf-8") as fh:
+                    text = fh.read()
+                if text:
+                    return f"{note}# {comp_name} — (local docs)\nSource: {local_path}\n\n{text[:8000]}"
+            except Exception as exc:
+                pass  # fall through to URL fetch
+
+    # ── Fall back to URL fetch via DocScraper (cached) ───────────────────────
     try:
         scraper = DocScraper()
         text = scraper.fetch(chosen_url, max_chars=8000)
         if not text:
             return f"{note}Fetched empty content from {chosen_url}"
-        return f"{note}# {entry.get('name', component)} — {chosen_type}\nSource: {chosen_url}\n\n{text}"
+        return f"{note}# {comp_name} — {chosen_type}\nSource: {chosen_url}\n\n{text}"
     except Exception as exc:
         return f"Failed to fetch {chosen_url}: {exc}"
 
@@ -2154,7 +2170,7 @@ def run_figma_to_angular(
     """
     METRICS.reset()
 
-    global DESIGN_TOKENS, DS_CATALOG, DOC_KNOWLEDGE, DS_CATALOG_ENTRY_MAP
+    global DESIGN_TOKENS, DS_CATALOG, DOC_KNOWLEDGE, DS_CATALOG_ENTRY_MAP, DS_DOCS_DIR
     DESIGN_TOKENS = design_tokens or {}
 
     if not design_system:
@@ -2180,6 +2196,14 @@ def run_figma_to_angular(
 
     knowledge = load_ds_knowledge(design_system)
     DOC_KNOWLEDGE = knowledge or {}
+
+    # Set DS_DOCS_DIR if local scraped docs exist (produced by scrape_ds_docs.py)
+    _docs_candidate = os.path.join(Config.DS_MAPPINGS_DIR, f"{design_system}_docs")
+    if os.path.isdir(_docs_candidate):
+        DS_DOCS_DIR = _docs_candidate
+        print(f"Local docs directory found: {DS_DOCS_DIR}")
+    else:
+        DS_DOCS_DIR = ""
 
     # Build a ds_config-like dict from catalog metadata for downstream compatibility
     ds_config = {
