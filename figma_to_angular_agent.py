@@ -133,17 +133,11 @@ def classify_figma_text_as_html(figma_node: Dict) -> str:
     ts = figma_node.get("styling", {}).get("textStyle", {})
     fs = ts.get("fontSize", 14)
     fw = ts.get("fontWeight", 400)
-    if fs >= 36 or (fs >= 28 and fw >= 700):
+    if fs >= 48 or (fs >= 36 and fw >= 700):
         return "h1"
-    if fs >= 28 or (fs >= 22 and fw >= 700):
+    if fs >= 32 or (fs >= 24 and fw >= 700):
         return "h2"
-    if fs >= 22 or (fs >= 18 and fw >= 700):
-        return "h3"
-    if fs >= 18 or (fs >= 16 and fw >= 600):
-        return "h4"
-    if fs >= 16:
-        return "h5"
-    return "p"
+    return "p"   # h3/h4/h5 gone — utility classes drive the visual size
 
 
 def _build_figma_node_lookup(figma_node: Dict, lookup: Optional[Dict] = None) -> Dict:
@@ -1519,6 +1513,21 @@ def _build_phase1_design_summary(ir_tree: List[Dict], max_items: int = 30) -> st
     """Build a compact (~20-40 line) design outline to drive Phase 1 class searches."""
     lines: List[str] = []
 
+    # Collect unique font sizes so Phase 1 can look up matching utility classes
+    font_sizes: set = set()
+
+    def _collect_sizes(node: Dict) -> None:
+        ts = node.get("styling", {}).get("textStyle", {})
+        if ts.get("fontSize"):
+            font_sizes.add(int(ts["fontSize"]))
+        for child in node.get("children", []):
+            _collect_sizes(child)
+
+    for n in ir_tree:
+        _collect_sizes(n)
+    if font_sizes:
+        lines.append(f"Typography sizes in design: {sorted(font_sizes, reverse=True)} px")
+
     def walk(node: Dict, depth: int = 0) -> None:
         if len(lines) >= max_items:
             return
@@ -1606,7 +1615,17 @@ Call search_doc_knowledge in this order (skip concerns absent from the design):
   5. search_doc_knowledge("shadow", "utilities")
   6. search_doc_knowledge("background surface", "utilities")
   7. search_doc_knowledge("text color", "utilities")
-  8. fetch_doc_page(url) only if a result needs deeper clarification
+  8. search_doc_knowledge("font size text", "content")
+  9. search_doc_knowledge("font size", "utilities")
+ 10. search_doc_knowledge("font weight", "utilities")
+ 11. fetch_doc_page(url) only if a result needs deeper clarification
+
+After the searches, produce a TYPOGRAPHY MAPPING TABLE:
+For each unique font size listed in "Typography sizes in design" above, find the
+closest utility class. Format exactly as:
+  64px → <class or "no match — use SCSS">
+  32px → <class or "no match — use SCSS">
+  ...
 """
 
     system_prompt = f"""You are a {ds_name} documentation researcher.
@@ -1622,7 +1641,7 @@ FINAL OUTPUT — two clearly labelled sections:
 - Spacing: <classes>
 - Color/surface: <classes>
 - Shadow: <classes>
-- Typography: <classes>
+- Typography: <class per font size — e.g. "64px → text-7xl, 32px → text-4xl, ...">
 
 ## Component APIs
 (One subsection per component)
@@ -1679,6 +1698,77 @@ Design being implemented:
     )
     print(f"  Phase 1: hit max iterations, using last AI content ({len(last)} chars)")
     return last
+
+
+# ============================================================================
+# STEP 4b: TYPOGRAPHY REFINEMENT HELPERS
+# ============================================================================
+
+class _RefinedFiles(BaseModel):
+    html: str
+    scss: str
+
+
+def _flatten_knowledge_for_refinement() -> str:
+    """Return a compact flat list of all utility classes from DOC_KNOWLEDGE."""
+    if not DOC_KNOWLEDGE:
+        return ""
+    lines = []
+    for sec_name, sec_data in DOC_KNOWLEDGE.get("sections", {}).items():
+        for entry_key, entry_data in sec_data.items():
+            classes = entry_data.get("classes", {})
+            if classes:
+                lines.append(f"[{sec_name}/{entry_key}]")
+                for cls, desc in list(classes.items())[:60]:
+                    lines.append(f"  .{cls} — {desc}")
+    return "\n".join(lines)
+
+
+def _run_typography_refinement(
+    llm: Any,
+    html_content: str,
+    scss_content: str,
+    ds_name: str,
+) -> tuple:
+    """Phase 2: Replace inline typography/layout styles with utility or SCSS classes."""
+    class_reference = _flatten_knowledge_for_refinement()
+
+    system = f"""You are an Angular template refactoring expert for {ds_name}.
+
+TASK: Rewrite the HTML and SCSS so that NO inline style= attributes remain for
+typography properties (font-size, font-weight, font-family, line-height,
+letter-spacing, text-align, color, opacity) or for layout properties that have a
+matching utility class (flex, gap, padding, margin, background-color,
+border-radius, box-shadow).
+
+RULES:
+1. If a utility class for the value exists in AVAILABLE CLASSES — add it to class=""
+2. If no utility class exists — move the style to a descriptive SCSS class
+   (e.g. .hero-title, .body-small, .card-label) and reference that class in HTML
+3. Do NOT change text content, component selectors, or Angular bindings
+4. Return valid, complete HTML and SCSS (do not truncate)
+5. Preserve all existing class="" values — only ADD to them, never remove
+
+AVAILABLE UTILITY CLASSES FROM {ds_name.upper()} DOCS:
+{class_reference or "(none loaded — move all remaining inline styles to named SCSS classes)"}
+"""
+
+    human = (
+        f"Refactor this Angular template and SCSS.\n\n"
+        f"=== HTML ===\n{html_content}\n\n"
+        f"=== SCSS ===\n{scss_content}"
+    )
+
+    structured = llm.with_structured_output(_RefinedFiles)
+    try:
+        result = structured.invoke([SystemMessage(content=system), HumanMessage(content=human)])
+        print(f"  Phase 2: refinement done "
+              f"(html {len(html_content)}→{len(result.html)} chars, "
+              f"scss {len(scss_content)}→{len(result.scss)} chars)")
+        return result.html, result.scss
+    except Exception as exc:
+        print(f"  Warning: typography refinement failed ({exc}), using original output")
+        return html_content, scss_content
 
 
 # ============================================================================
@@ -1821,11 +1911,15 @@ CRITICAL TEXT RULES:
 - Actual display text comes ONLY from "text" or "innerText" fields
 
 ## TEXT NODE RULES (ABSOLUTE):
-- Every IR node with type="text" maps to a NATIVE HTML tag, never a DS component
-- The mapping step has already classified each text node — check the ds_selector in component_hierarchy_with_ds_mappings
-- Use h1/h2/h3/h4/h5/h6/p exactly as specified in ds_selector for nodes where ds_component="native"
-- NEVER use an alert, badge, notification, or any DS component for plain text content
-- The ds_selector field for text nodes contains the HTML tag (e.g., "h2", "p") — use it literally as the element tag
+- Every IR node with type="text" maps to a NATIVE HTML tag (p, h1, h2, span), never a DS component
+- Use the ds_selector value from component_hierarchy_with_ds_mappings as the tag
+- INLINE TYPOGRAPHY STYLES ARE FORBIDDEN:
+    Do NOT write style="font-size: ...", style="font-weight: ...",
+    style="line-height: ...", or style="letter-spacing: ..." on ANY element
+- INSTEAD: apply typography utility classes from Phase 1 (e.g. class="text-7xl font-medium")
+- If no utility class was found for a size, add a descriptive SCSS class
+  (e.g. .hero-title, .card-subtitle) and define it in the SCSS file
+- color/opacity for text: use a utility class if one was found, otherwise SCSS
 
 {code_gen_mappings_section}
 {utility_classes_section}
@@ -1842,11 +1936,10 @@ GENERATE:
 - Use flexbox fallback classes "flex-row"/"flex-column" ONLY if no {ds_name} layout utility class was found
 
 3. SCSS Styles:
-- ONLY write SCSS for styles NOT already covered by the utility classes listed above
-- If a utility class exists for display:flex, gap, padding, color, shadow — use the class, not SCSS
-- You MAY still write custom SCSS for: exact pixel values with no utility match,
-  component-level overrides, hover states, specific widths/heights from Figma
-- .flex-row / .flex-column fallback definitions ONLY if no layout utility class was found
+- Typography (font-size, font-weight, line-height, letter-spacing) MUST use
+  utility classes OR named SCSS classes — NEVER inline style= attributes
+- Layout (flex, gap, padding) → utility class first; custom SCSS only if no match
+- .flex-row / .flex-column ONLY if no layout utility class was found
 
 4. ds_components_used: Populate this array with EVERY {ds_name} component used in the template.
    For each component, include: figma_node_id, ds_component name, ds_selector, inputs, outputs.
@@ -1921,6 +2014,58 @@ This visual analysis takes precedence for styling."""
         )
 
     METRICS.end_step("generate_code")
+    return state
+
+
+# ============================================================================
+# STEP 4b: REFINE TYPOGRAPHY
+# ============================================================================
+
+def refine_typography_node(state: AgentState) -> AgentState:
+    """Step 4b: Post-process — replace inline typography with classes."""
+    METRICS.start_step("refine_typography")
+    generated = state.get("generated")
+    if not generated or not generated.files:
+        METRICS.end_step("refine_typography")
+        return state
+
+    ds_name = (state.get("ds_config") or {}).get("name", "the design system")
+    llm = ChatOpenAI(model=Config.LLM_MODEL, temperature=0.0)
+
+    html_file = next((f for f in generated.files if f.path.endswith(".html")), None)
+    scss_file = next((f for f in generated.files if f.path.endswith(".scss")), None)
+
+    if not html_file:
+        METRICS.end_step("refine_typography")
+        return state
+
+    print("Phase 2: typography refinement...")
+    html_out, scss_out = _run_typography_refinement(
+        llm, html_file.content, scss_file.content if scss_file else "", ds_name
+    )
+    METRICS.record_llm_call(
+        len(html_file.content) + len(scss_file.content if scss_file else ""),
+        len(html_out) + len(scss_out),
+        "refine_typography",
+    )
+
+    new_files = []
+    for f in generated.files:
+        if f.path == html_file.path:
+            new_files.append(GeneratedFile(path=f.path, content=html_out))
+        elif scss_file and f.path == scss_file.path:
+            new_files.append(GeneratedFile(path=f.path, content=scss_out))
+        else:
+            new_files.append(f)
+
+    state["generated"] = GeneratedAngularArtifact(
+        component_name=generated.component_name,
+        files=new_files,
+        ds_components_used=generated.ds_components_used,
+        imports=generated.imports,
+        unresolved_nodes=generated.unresolved_nodes,
+    )
+    METRICS.end_step("refine_typography")
     return state
 
 
@@ -2125,6 +2270,7 @@ def create_workflow() -> StateGraph:
     workflow.add_node("build_ir", build_ir_node)
     workflow.add_node("map_to_ds", map_to_design_system_node)
     workflow.add_node("generate_code", generate_angular_code_node)
+    workflow.add_node("refine_typography", refine_typography_node)
     workflow.add_node("validate", validate_node)
     workflow.add_node("repair", repair_node)
 
@@ -2132,13 +2278,14 @@ def create_workflow() -> StateGraph:
     workflow.add_edge("ingest_figma", "build_ir")
     workflow.add_edge("build_ir", "map_to_ds")
     workflow.add_edge("map_to_ds", "generate_code")
-    workflow.add_edge("generate_code", "validate")
+    workflow.add_edge("generate_code", "refine_typography")
+    workflow.add_edge("refine_typography", "validate")
     workflow.add_conditional_edges(
         "validate",
         should_repair,
         {"repair": "repair", "complete": END},
     )
-    workflow.add_edge("repair", "validate")
+    workflow.add_edge("repair", "refine_typography")
 
     print("create_workflow: before compile")
     return workflow.compile()
