@@ -11,6 +11,7 @@ from typing import TypedDict, List, Dict, Any, Optional
 from dataclasses import dataclass, field
 import json
 import os
+import re
 import base64
 import requests
 import time
@@ -152,6 +153,16 @@ def _build_figma_node_lookup(figma_node: Dict, lookup: Optional[Dict] = None) ->
     return lookup
 
 
+def _build_parent_name_map(nodes: List[Dict], parent_name: str = "", result: Optional[Dict] = None) -> Dict:
+    """Recursively build a {node_id → parent_name} map for every node in the IR tree."""
+    if result is None:
+        result = {}
+    for n in nodes:
+        result[n.get("id", "")] = parent_name
+        _build_parent_name_map(n.get("children", []), n.get("name", ""), result)
+    return result
+
+
 def _infer_native_html_tag(ir_node: Dict) -> str:
     """Return a sensible native HTML tag for an IR node that has no DS component match."""
     type_map = {
@@ -176,44 +187,69 @@ def _infer_native_html_tag(ir_node: Dict) -> str:
 # CATALOG-BASED COMPONENT SCORING
 # ============================================================================
 
-def _score_catalog_match(ir_node: Dict, figma_node_name: str, entry: Dict) -> int:
+def _score_catalog_match(
+    ir_node: Dict,
+    figma_node_name: str,
+    entry: Dict,
+    figma_orig_node: Optional[Dict] = None,
+) -> int:
     """Return a 0–100 score for how well a catalog entry matches this IR node.
 
-    Scoring:
-      +60  any figma_hint substring found in the Figma layer name (case-insensitive)
-      +30  IR semantic type matches the entry name exactly
+    Signals (cumulative, capped at 100):
+      +70  exact word-boundary hit in layer name          (very strong)
+      +45  substring hit in layer name                    (strong; only if no exact hit)
+      +25  IR semantic type maps to this entry name       (existing)
+      +15  Figma node type (INSTANCE/FRAME/…) in entry's figma_node_types
+      + 5  node is a Figma INSTANCE (likely a real component)
+      +15  any child node's name contains a catalog hint  (structural context)
     """
     score = 0
     ir_type = ir_node.get("type", "")
     name_lower = figma_node_name.lower()
+    hints = entry.get("figma_hints", [])
 
-    for hint in entry.get("figma_hints", []):
-        if hint.lower() in name_lower:
-            score += 60
+    # ── Hint matching — word boundary beats substring ─────────────────────
+    exact_hit = False
+    for hint in hints:
+        hl = hint.lower()
+        if re.search(rf"\b{re.escape(hl)}\b", name_lower):
+            score += 70
+            exact_hit = True
             break
+    if not exact_hit:
+        for hint in hints:
+            if hint.lower() in name_lower:
+                score += 45
+                break
 
-    # Semantic type alignment
-    type_to_entry = {
-        "button": "button",
-        "card": "card",
-        "input": "input",
-        "checkbox": "checkbox",
-        "radio": "radiobutton",
-        "toggle": "toggleswitch",
-        "tab": "tabs",
-        "table": "table",
-        "dialog": "dialog",
-        "chip": "chip",
-        "badge": "badge",
-        "icon": "icon",
-        "avatar": "avatar",
-        "divider": "divider",
-        "select": "select",
-        "slider": "slider",
-        "progress": "progressbar",
+    # ── IR semantic type alignment ─────────────────────────────────────────
+    _type_to_entry = {
+        "button": "button", "card": "card", "input": "inputtext",
+        "checkbox": "checkbox", "radio": "radiobutton", "toggle": "toggleswitch",
+        "tab": "tabs", "table": "table", "dialog": "dialog", "chip": "chip",
+        "badge": "badge", "icon": "icon", "avatar": "avatar", "divider": "divider",
+        "select": "select", "slider": "slider", "progress": "progressbar",
     }
-    if type_to_entry.get(ir_type) == entry.get("name"):
-        score += 30
+    if _type_to_entry.get(ir_type) == entry.get("name"):
+        score += 25
+
+    # ── Figma node type alignment ──────────────────────────────────────────
+    if figma_orig_node:
+        figma_type = figma_orig_node.get("type", "")
+        allowed = entry.get("figma_node_types", [])
+        if figma_type and allowed and figma_type in allowed:
+            score += 15
+        if figma_type == "INSTANCE":
+            score += 5   # INSTANCE nodes are almost certainly component instances
+
+    # ── Children hint analysis ─────────────────────────────────────────────
+    children = ir_node.get("children", [])
+    if children:
+        children_text = " ".join(c.get("name", "").lower() for c in children[:10])
+        for hint in hints:
+            if hint.lower() in children_text:
+                score += 15
+                break
 
     return min(score, 100)
 
@@ -233,7 +269,7 @@ def _resolve_ambiguous_with_llm(ambiguous_nodes: List[Dict], catalog_entries: Li
         {
             "name": c["name"],
             "selector": c["selector"],
-            "description": c.get("description", "")[:100],
+            "description": c.get("description", ""),
             "hints": c.get("figma_hints", []),
         }
         for c in catalog_entries
@@ -241,11 +277,26 @@ def _resolve_ambiguous_with_llm(ambiguous_nodes: List[Dict], catalog_entries: Li
 
     nodes_payload = [
         {
-            "id": item["ir_node"].get("id"),
-            "type": item["ir_node"].get("type"),
-            "name": item["ir_node"].get("name"),
+            "id":          item["ir_node"].get("id"),
+            "figma_type":  item.get("figma_type", ""),
+            "ir_type":     item["ir_node"].get("type"),
+            "name":        item["ir_node"].get("name"),
+            "parent_name": item.get("parent_name", ""),
+            "children": [
+                {"name": c.get("name"), "type": c.get("type")}
+                for c in item["ir_node"].get("children", [])[:8]
+            ],
+            "inner_text":  (item["ir_node"].get("properties") or {}).get("innerText", "")[:100],
+            "has_shadow":  bool(item["ir_node"].get("styling", {}).get("effects")),
+            "has_fill":    bool(item["ir_node"].get("styling", {}).get("fills")),
             "candidates": [
-                {"score": s, "name": e["name"], "selector": e["selector"]}
+                {
+                    "score":       s,
+                    "name":        e["name"],
+                    "selector":    e["selector"],
+                    "description": e.get("description", ""),
+                    "hints":       e.get("figma_hints", []),
+                }
                 for s, e in item["top3"]
             ],
         }
@@ -261,7 +312,7 @@ For each node below, choose the best matching component selector, or use a plain
 HTML tag ("div", "section", "ul", etc.) if nothing fits.
 
 Return a JSON array — one object per node:
-[{{"id": "<node_id>", "ds_component": "<component_name_or_native>", "ds_selector": "<selector_or_html_tag>"}}]
+[{{"id": "<node_id>", "ds_component": "<component_name_or_native>", "ds_selector": "<selector_or_html_tag>", "reasoning": "<one sentence>"}}]
 
 Nodes to resolve:
 {json.dumps(nodes_payload, indent=2)}
@@ -302,6 +353,85 @@ Output ONLY valid JSON array, no markdown fences or explanation."""
         }
         for item in ambiguous_nodes
     ]
+
+
+def _resolve_low_confidence_nodes(
+    low_confidence_nodes: List[Dict],
+    catalog_entries: List[Dict],
+) -> List[Dict]:
+    """Per-node LLM call with full IR subtree — for nodes with very low scoring confidence (1–29)."""
+    if not low_confidence_nodes:
+        return []
+
+    llm = ChatOpenAI(model=Config.LLM_MODEL, temperature=0.0, api_key=Config.OPENAI_API_KEY)
+    results = []
+
+    full_catalog = [
+        {
+            "name":        c["name"],
+            "selector":    c["selector"],
+            "description": c.get("description", ""),
+            "hints":       c.get("figma_hints", []),
+            "node_types":  c.get("figma_node_types", []),
+        }
+        for c in catalog_entries
+    ]
+
+    for item in low_confidence_nodes:
+        ir_node   = item["ir_node"]
+        node_id   = ir_node.get("id", "")
+        node_name = ir_node.get("name", "")
+
+        prompt = f"""You are mapping a Figma design node to its best design system component.
+
+## Available Components
+{json.dumps(full_catalog, indent=2)}
+
+## Node to Map
+{json.dumps({
+    "id":          node_id,
+    "name":        node_name,
+    "figma_type":  item["figma_type"],
+    "ir_type":     ir_node.get("type"),
+    "parent_name": item["parent_name"],
+    "children":    ir_node.get("children", [])[:10],
+    "properties":  ir_node.get("properties", {}),
+    "styling":     ir_node.get("styling", {}),
+    "layout":      ir_node.get("layout", ""),
+}, indent=2)}
+
+Choose the best component, or output ds_component="native" with an appropriate HTML tag
+(div, section, ul, etc.) if none fits.
+
+Output ONLY this JSON (no markdown):
+{{"id": "{node_id}", "ds_component": "<name or native>", "ds_selector": "<selector or tag>", "reasoning": "<one sentence>"}}"""
+
+        try:
+            METRICS.record_llm_call(len(prompt), 0, "low_conf_resolution")
+            response = llm.invoke([
+                SystemMessage(content="Map UI nodes to design system components. Output ONLY valid JSON."),
+                HumanMessage(content=prompt),
+            ])
+            if METRICS.log_trace:
+                METRICS.log_trace[-1]["message"] += f" / {len(response.content)} out chars"
+            parsed = _parse_llm_json_response(response.content)
+            print(f"  Low-conf node '{node_name}' → {parsed.get('ds_component')} ({parsed.get('reasoning', '')})")
+            results.append({
+                "figma_node_id": node_id,
+                "ds_component":  parsed.get("ds_component", "native"),
+                "ds_selector":   parsed.get("ds_selector", "div"),
+                "inputs": {},
+            })
+        except Exception as exc:
+            print(f"  Warning: low-confidence resolution failed for '{node_name}': {exc}")
+            results.append({
+                "figma_node_id": node_id,
+                "ds_component":  "native",
+                "ds_selector":   _infer_native_html_tag(ir_node),
+                "inputs": {},
+            })
+
+    return results
 
 
 # ============================================================================
@@ -1047,11 +1177,14 @@ def _flatten_ir_nodes(ir_nodes: List[Dict], parent_id: Optional[str] = None) -> 
 # ============================================================================
 
 def map_to_design_system_node(state: AgentState) -> AgentState:
-    """Step 3: Map IR nodes to DS components using catalog scoring + optional batch LLM.
+    """Step 3: Map IR nodes to DS components using catalog scoring + tiered LLM fallback.
 
     TEXT nodes are always classified as native HTML (h1–h6 / p) — no LLM involved.
-    Non-text nodes with a high-confidence catalog match (score ≥ 60) are mapped
-    deterministically. Ambiguous nodes are resolved in a single batch LLM call.
+    Non-text nodes are scored against the catalog using 6 signals, then tiered:
+      - score ≥ 70  → definite deterministic match
+      - score 30–69 → batch LLM call with rich context (_resolve_ambiguous_with_llm)
+      - score 1–29  → per-node LLM call with full subtree (_resolve_low_confidence_nodes)
+      - score = 0   → native HTML fallback
     """
     METRICS.start_step("map_to_ds")
 
@@ -1067,12 +1200,16 @@ def map_to_design_system_node(state: AgentState) -> AgentState:
     figma_lookup = _build_figma_node_lookup(state.get("figma_json") or {})
     scraper = DocScraper()
 
+    # Build parent-name map for richer LLM context
+    parent_name_map = _build_parent_name_map(state["ir_tree"])
+
     flat_ir_nodes = _flatten_ir_nodes(state["ir_tree"])
     print(f"Mapping {len(flat_ir_nodes)} IR nodes "
           f"(catalog: {len(catalog_entries)} components)...")
 
     definite_mappings: List[Dict] = []
-    ambiguous_nodes: List[Dict] = []
+    ambiguous_nodes: List[Dict] = []       # score 30–69
+    low_confidence_nodes: List[Dict] = []  # score 1–29
 
     for ir_node in flat_ir_nodes:
         node_id = ir_node.get("id", "")
@@ -1101,35 +1238,49 @@ def map_to_design_system_node(state: AgentState) -> AgentState:
             })
             continue
 
-        # ── Score catalog entries ──────────────────────────────────────────
+        # ── Score catalog entries (6 signals) ─────────────────────────────
+        figma_orig_node = figma_lookup.get(node_id)
         scored = sorted(
             [
                 (s, entry)
                 for entry in catalog_entries
-                if (s := _score_catalog_match(ir_node, node_name, entry)) > 0
+                if (s := _score_catalog_match(ir_node, node_name, entry, figma_orig_node)) > 0
             ],
             key=lambda x: x[0],
             reverse=True,
         )
 
-        if scored and scored[0][0] >= 60:
-            # High-confidence deterministic match
+        if scored and scored[0][0] >= 70:
+            # Tier 1: definite deterministic match
             best_entry = scored[0][1]
-            # Scrape API docs for context (cached, non-fatal)
             api_url = best_entry.get("urls", {}).get("api", "")
             if api_url:
                 scraper.fetch(api_url)  # prime cache; context not used directly here
+            print(f"  Definite match: '{node_name}' → {best_entry['name']} (score {scored[0][0]})")
             definite_mappings.append({
                 "figma_node_id": node_id,
                 "ds_component": best_entry["name"],
                 "ds_selector": best_entry["selector"],
                 "inputs": {},
             })
+        elif scored and scored[0][0] >= 30:
+            # Tier 2: medium ambiguity → batch LLM with rich context
+            ambiguous_nodes.append({
+                "ir_node":     ir_node,
+                "figma_type":  figma_orig_node.get("type", "") if figma_orig_node else "",
+                "parent_name": parent_name_map.get(node_id, ""),
+                "top3":        scored[:3],
+            })
         elif scored:
-            # Ambiguous — defer to batch LLM
-            ambiguous_nodes.append({"ir_node": ir_node, "top3": scored[:3]})
+            # Tier 3: low confidence → per-node LLM with full subtree
+            low_confidence_nodes.append({
+                "ir_node":     ir_node,
+                "figma_type":  figma_orig_node.get("type", "") if figma_orig_node else "",
+                "parent_name": parent_name_map.get(node_id, ""),
+                "top3":        scored[:3],
+            })
         else:
-            # No match — native HTML
+            # Score = 0 → native HTML
             definite_mappings.append({
                 "figma_node_id": node_id,
                 "ds_component": "native",
@@ -1137,11 +1288,17 @@ def map_to_design_system_node(state: AgentState) -> AgentState:
                 "inputs": {},
             })
 
-    # ── Batch resolve ambiguous nodes (1 LLM call) ────────────────────────
+    # ── Tier 2: Batch resolve ambiguous nodes ─────────────────────────────
     if ambiguous_nodes:
         print(f"Resolving {len(ambiguous_nodes)} ambiguous nodes with LLM batch call...")
         ambiguous_resolved = _resolve_ambiguous_with_llm(ambiguous_nodes, catalog_entries)
         definite_mappings.extend(ambiguous_resolved)
+
+    # ── Tier 3: Per-node resolve low-confidence nodes ─────────────────────
+    if low_confidence_nodes:
+        print(f"Resolving {len(low_confidence_nodes)} low-confidence nodes with per-node LLM calls...")
+        resolved_lc = _resolve_low_confidence_nodes(low_confidence_nodes, catalog_entries)
+        definite_mappings.extend(resolved_lc)
 
     # ── Build DSComponentMapping objects ──────────────────────────────────
     try:
