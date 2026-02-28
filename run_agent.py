@@ -3,16 +3,21 @@
 Runner script for Figma-to-Angular agent.
 
 Usage:
-    python run_agent.py <design_system_name>
+    python run_agent.py <design_system_name> [screenshot.png|screenshot.jpg]
 
-Example:
+Examples:
     python run_agent.py primeng
+    python run_agent.py primeng my_design.png
+    python run_agent.py primeng /path/to/screenshot.jpg
 
 The design_system_name maps to:
     design_systems/<name>_catalog.json
 
 Copy design_systems/template_catalog.json to design_systems/<name>_catalog.json
 and fill in your components before running.
+
+If no screenshot argument is given, the script falls back to figma_screenshots.json
+(if it exists) and then to the thumbnailUrl embedded in figma_tree.json.
 """
 
 import json
@@ -22,10 +27,35 @@ from pathlib import Path
 from figma_to_angular_agent import run_figma_to_angular, METRICS
 
 
+def screenshot_to_figma_screenshots(image_path: str) -> dict:
+    """Convert a local PNG/JPG file into the figma_screenshots dict the agent expects.
+
+    The agent reads figma_screenshots["main"] as a file path or URL and passes it
+    to fetch_image_as_base64, so we just store the resolved absolute path here.
+
+    Args:
+        image_path: Path to a .png or .jpg/.jpeg file.
+
+    Returns:
+        {"main": "<absolute_path>"} ready to pass as figma_screenshots.
+
+    Raises:
+        FileNotFoundError: if the file does not exist.
+        ValueError: if the file extension is not a supported image type.
+    """
+    p = Path(image_path).resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"Screenshot not found: {image_path}")
+    if p.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+        raise ValueError(f"Unsupported image format '{p.suffix}'. Use .png or .jpg/.jpeg.")
+    return {"main": str(p)}
+
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python run_agent.py <design_system_name>")
+        print("Usage: python run_agent.py <design_system_name> [screenshot.png|screenshot.jpg]")
         print("  Example: python run_agent.py primeng")
+        print("  Example: python run_agent.py primeng my_design.png")
         print("")
         print("  The name maps to design_systems/<name>_catalog.json")
         print("  Copy design_systems/template_catalog.json and fill it in if the file doesn't exist.")
@@ -50,9 +80,17 @@ def main():
         with open("design_tokens.json") as f:
             design_tokens = json.load(f)
 
+    # Screenshot: CLI arg takes priority, then figma_screenshots.json, then nothing
     figma_screenshots = None
-    if Path("figma_screenshots.json").exists():
-        print("  Found Figma screenshots")
+    if len(sys.argv) >= 3:
+        image_arg = sys.argv[2]
+        try:
+            figma_screenshots = screenshot_to_figma_screenshots(image_arg)
+            print(f"  Screenshot loaded from argument: {image_arg}")
+        except (FileNotFoundError, ValueError) as e:
+            print(f"  Warning: {e} — skipping screenshot.")
+    elif Path("figma_screenshots.json").exists():
+        print("  Found figma_screenshots.json")
         with open("figma_screenshots.json") as f:
             figma_screenshots = json.load(f)
 
