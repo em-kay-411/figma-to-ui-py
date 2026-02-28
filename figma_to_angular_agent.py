@@ -2449,6 +2449,225 @@ def create_workflow() -> StateGraph:
 
 
 # ============================================================================
+# GENERATION HELPERS (screenshot / prompt path + iterative refinement)
+# ============================================================================
+
+def generate_html_from_input(
+    prompt: Optional[str] = None,
+    screenshot_path: Optional[str] = None,
+) -> tuple:
+    """Step 1 of the screenshot/prompt path.
+
+    Returns (html: str, css: str) describing the UI.
+    At least one of prompt or screenshot_path must be provided.
+    """
+    llm = ChatOpenAI(
+        model=Config.LLM_MODEL,
+        temperature=0.1,
+        api_key=Config.OPENAI_API_KEY,
+    )
+
+    system = """You are a UI developer. Given a design screenshot and/or description,
+produce clean semantic HTML and CSS that faithfully reproduces the layout, content,
+and visual structure. Use class names that reflect component semantics (e.g. btn,
+card, input-field). Do NOT use inline styles — put all styles in the CSS block.
+
+Return ONLY a JSON object:
+{"html": "<full html string>", "css": "<full css string>"}"""
+
+    content_parts: List[Any] = []
+    if prompt:
+        content_parts.append({"type": "text", "text": f"Design description: {prompt}"})
+    if screenshot_path:
+        b64 = fetch_image_as_base64(screenshot_path)
+        if b64:
+            content_parts.append({
+                "type": "image_url",
+                "image_url": {"url": b64, "detail": "high"},
+            })
+    if not content_parts:
+        raise ValueError("At least one of prompt or screenshot_path must be provided")
+
+    METRICS.record_llm_call(len(str(content_parts)), 0, "html_from_input")
+    response = llm.invoke([
+        SystemMessage(content=system),
+        HumanMessage(content=content_parts),
+    ])
+    if METRICS.log_trace:
+        METRICS.log_trace[-1]["message"] += f" / {len(response.content)} out chars"
+
+    parsed = _parse_llm_json_response(response.content)
+    return parsed.get("html", ""), parsed.get("css", "")
+
+
+def html_to_figma_tree(html: str, css: str, name: str = "Generated Design") -> Dict:
+    """Convert native HTML + CSS into a synthetic Figma-like JSON tree.
+
+    The output matches the minimal Figma export format that ingest_figma_node
+    and build_ir_node expect: document → PAGE → children tree.
+    Each node has: id, name, type (FRAME/TEXT/INSTANCE/GROUP), children,
+    and a styling block (fills, textStyle, effects, etc.) inferred from the CSS.
+    """
+    llm = ChatOpenAI(
+        model=Config.LLM_MODEL,
+        temperature=0.0,
+        api_key=Config.OPENAI_API_KEY,
+    )
+
+    system = """You are converting an HTML/CSS document into a Figma-like JSON tree.
+
+Rules:
+- Root wrapper is a PAGE node with one FRAME child (the screen)
+- Block elements → FRAME nodes
+- Text nodes → TEXT nodes with textStyle (fontSize, fontWeight, color)
+- Interactive elements (button, input, select, checkbox) → INSTANCE nodes
+  with componentType matching the element type
+- Use semantic names from class names or element types
+- Extract fills (background-color), strokes (border), effects (box-shadow)
+  from the CSS and embed them in each node's styling object
+- Assign sequential integer ids as strings ("1", "2", ...)
+- Every node must have: id, name, type, children ([] for leaves), styling {}
+
+Return ONLY valid JSON — no markdown fences."""
+
+    prompt = f"""HTML:
+```html
+{html}
+```
+
+CSS:
+```css
+{css}
+```
+
+Produce the full Figma-like JSON tree. Wrap it in the standard Figma export envelope:
+{{
+  "name": "{name}",
+  "document": {{
+    "id": "0",
+    "name": "Document",
+    "type": "DOCUMENT",
+    "children": [{{
+      "id": "1",
+      "name": "Page 1",
+      "type": "PAGE",
+      "children": [ ... ]
+    }}]
+  }},
+  "components": {{}},
+  "styles": {{}},
+  "schemaVersion": 0
+}}"""
+
+    METRICS.record_llm_call(len(system) + len(prompt), 0, "html_to_figma_tree")
+    response = llm.invoke([
+        SystemMessage(content=system),
+        HumanMessage(content=prompt),
+    ])
+    if METRICS.log_trace:
+        METRICS.log_trace[-1]["message"] += f" / {len(response.content)} out chars"
+    return _parse_llm_json_response(response.content)
+
+
+def generate_from_prompt(
+    design_system: str,
+    prompt: Optional[str] = None,
+    screenshot_path: Optional[str] = None,
+    design_tokens: Optional[Dict] = None,
+) -> "GeneratedAngularArtifact":
+    """Full pipeline for screenshot/prompt-only input (no Figma JSON).
+
+    Synthesizes a Figma-like tree from the input, then runs the standard pipeline.
+    """
+    print("Generating HTML from input...")
+    html, css = generate_html_from_input(prompt=prompt, screenshot_path=screenshot_path)
+
+    print("Converting HTML to synthetic Figma tree...")
+    synthetic_figma = html_to_figma_tree(html, css, name=prompt or "Generated Design")
+
+    figma_screenshots = {"main": screenshot_path} if screenshot_path else None
+
+    return run_figma_to_angular(
+        figma_json=synthetic_figma,
+        design_tokens=design_tokens,
+        figma_screenshots=figma_screenshots,
+        design_system=design_system,
+    )
+
+
+def refine_with_prompt(
+    current_artifact: "GeneratedAngularArtifact",
+    prompt: str,
+    design_system: str,
+    component_mappings: Optional[List] = None,
+    screenshot_path: Optional[str] = None,
+) -> "GeneratedAngularArtifact":
+    """Apply a natural-language change to existing generated Angular files.
+
+    Single LLM call — does not re-run the full pipeline.
+    The DS catalog constrains which components may be used.
+    """
+    catalog = load_ds_catalog(design_system)
+    if not catalog:
+        raise ValueError(f"Design system catalog not found: {design_system}")
+
+    component_guide = build_catalog_code_gen_prompt(catalog)
+    current_files = {f.file_type: f.content for f in current_artifact.files}
+
+    screenshot_section = ""
+    if screenshot_path and Config.USE_SCREENSHOT_ANALYSIS:
+        styling = analyze_screenshot_for_styling(screenshot_path, prompt)
+        if styling:
+            screenshot_section = (
+                f"\n\nVisual reference:\n{json.dumps(styling, indent=2)}"
+            )
+
+    mappings_text = "\n".join(
+        f"  - {m.ds_selector} ({m.ds_component})"
+        for m in (component_mappings or [])
+        if m.ds_component != "native"
+    ) or "(none)"
+
+    llm = ChatOpenAI(
+        model=Config.LLM_MODEL,
+        temperature=Config.LLM_TEMPERATURE,
+        api_key=Config.OPENAI_API_KEY,
+    ).with_structured_output(GeneratedAngularArtifact)
+
+    system = f"""You are an expert Angular developer using the {catalog.get('name', design_system)} design system.
+Apply the user's requested change to the Angular component. Preserve all unaffected structure.
+Only use components available in this design system:
+{component_guide}
+Return COMPLETE updated files — not diffs."""
+
+    user = f"""Component: {current_artifact.component_name}
+
+HTML:
+```html
+{current_files.get('html', '')}
+```
+TypeScript:
+```typescript
+{current_files.get('typescript', '')}
+```
+SCSS:
+```scss
+{current_files.get('scss', '')}
+```
+DS components in use:
+{mappings_text}
+{screenshot_section}
+
+Change requested: {prompt}"""
+
+    METRICS.record_llm_call(len(system) + len(user), 0, "refine_prompt")
+    result = llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
+    if METRICS.log_trace:
+        METRICS.log_trace[-1]["message"] += " / structured output"
+    return result
+
+
+# ============================================================================
 # MAIN ENTRY POINT
 # ============================================================================
 

@@ -7,3 +7,6 @@ python-dotenv
 selenium
 html2text
 beautifulsoup4
+fastapi
+uvicorn[standard]
+python-multipart
