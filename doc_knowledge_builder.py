@@ -52,6 +52,36 @@ EXTRACTION_SYSTEM_PROMPT = (
     "You read documentation and output ONLY valid JSON — no markdown, no explanation."
 )
 
+COMPONENT_METADATA_SYSTEM = (
+    "You are an Angular library API expert. "
+    "Read documentation and output ONLY valid JSON — no markdown, no explanation."
+)
+
+COMPONENT_METADATA_TEMPLATE = """\
+Given this Angular component documentation for "{name}" (from package "{import_path}"):
+
+{doc_text}
+
+Extract:
+1. The exact TypeScript import statement to include in an Angular component file.
+2. The Angular module/class names to add to the @Component imports array.
+3. Any attribute directive selectors this module exports (e.g. pButton, pInputText), with a brief description.
+
+Return ONLY this JSON:
+{{
+  "import_statement": "import {{ XModule }} from '{import_path}/x';",
+  "component_classes": ["XModule"],
+  "directives": [
+    {{"selector": "xDirective", "description": "One-line description"}}
+  ]
+}}
+Rules:
+- import_statement: single exact import line for this specific component
+- component_classes: array of Angular class name strings only
+- directives: attribute selectors used in HTML markup (not component tags)
+- If no directives, use []
+Output ONLY valid JSON."""
+
 EXTRACTION_USER_TEMPLATE = """\
 Given this documentation page about "{title}":
 
@@ -89,6 +119,13 @@ def _save_knowledge(design_system: str, knowledge: Dict) -> str:
     path = os.path.join(DS_DIR, f"{design_system}_knowledge.json")
     with open(path, "w") as f:
         json.dump(knowledge, f, indent=2)
+    return path
+
+
+def _save_catalog(design_system: str, catalog: Dict) -> str:
+    path = os.path.join(DS_DIR, f"{design_system}_catalog.json")
+    with open(path, "w") as f:
+        json.dump(catalog, f, indent=2)
     return path
 
 
@@ -212,6 +249,112 @@ def _process_section(
     return section_data
 
 
+def _extract_angular_metadata_from_doc(
+    llm: ChatOpenAI,
+    name: str,
+    doc_text: str,
+    import_path: str,
+) -> Dict[str, Any]:
+    """Call LLM to extract import_statement, component_classes, directives.
+
+    Returns a dict with those three keys.
+    On failure, returns safe empty values so the caller can continue.
+    """
+    if not doc_text.strip():
+        print(f"    Skipping '{name}' — empty doc content")
+        return {"import_statement": "", "component_classes": [], "directives": []}
+
+    user_content = COMPONENT_METADATA_TEMPLATE.format(
+        name=name,
+        import_path=import_path,
+        doc_text=doc_text[:MAX_CHARS_PER_PAGE],
+    )
+    try:
+        response = llm.invoke([
+            SystemMessage(content=COMPONENT_METADATA_SYSTEM),
+            HumanMessage(content=user_content),
+        ])
+        raw = response.content.strip()
+        if raw.startswith("```"):
+            parts = raw.split("```")
+            raw = parts[1] if len(parts) >= 2 else raw
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        result = json.loads(raw)
+        return {
+            "import_statement": result.get("import_statement", ""),
+            "component_classes": result.get("component_classes", []),
+            "directives": result.get("directives", []),
+        }
+    except json.JSONDecodeError as exc:
+        print(f"    Warning: JSON parse error for '{name}': {exc}")
+    except Exception as exc:
+        print(f"    Warning: LLM call failed for '{name}': {exc}")
+    return {"import_statement": "", "component_classes": [], "directives": []}
+
+
+def enrich_catalog_components(design_system: str, overwrite: bool = False) -> None:
+    """Populate import_statement, component_classes, directives for each catalog component.
+
+    Source priority for each component's doc text:
+      1. design_systems/{ds}_docs/components/{name}.md  (from scrape_ds_docs.py)
+      2. The component's 'api' URL fetched via DocScraper (fallback)
+
+    Skips components that already have import_statement populated unless --overwrite.
+    Writes results directly back to {design_system}_catalog.json.
+    """
+    print(f"\n{'='*60}")
+    print(f"Enriching catalog components for: {design_system}")
+    print(f"{'='*60}\n")
+
+    catalog = _load_catalog(design_system)
+    import_path = catalog.get("import_path", "")
+
+    scraper = DocScraper(cache_dir=BUILDER_CACHE_DIR)
+    llm = ChatOpenAI(model=LLM_MODEL, temperature=0.0, api_key=os.getenv("OPENAI_API_KEY"))
+
+    components = catalog.get("components", [])
+    updated = skipped = 0
+
+    for comp in components:
+        name = comp.get("name", "")
+        if not name:
+            continue
+
+        if not overwrite and comp.get("import_statement"):
+            print(f"  [{name}] skipped (already populated; use --overwrite to redo)")
+            skipped += 1
+            continue
+
+        # Prefer local scraped .md (same path scrape_ds_docs.py writes)
+        doc_text = _read_local_page(design_system, "components", name)
+        if doc_text:
+            print(f"  [{name}] reading local component doc")
+        else:
+            api_url = (comp.get("urls") or {}).get("api") or (comp.get("urls") or {}).get("overview")
+            if api_url:
+                print(f"  [{name}] fetching {api_url}")
+                doc_text = scraper.fetch(api_url, max_chars=MAX_CHARS_PER_PAGE)
+            else:
+                print(f"  [{name}] skipped — no local file and no URL")
+                continue
+
+        metadata = _extract_angular_metadata_from_doc(llm, name, doc_text, import_path)
+        time.sleep(SLEEP_BETWEEN_CALLS)
+
+        comp["import_statement"] = metadata["import_statement"]
+        comp["component_classes"] = metadata["component_classes"]
+        comp["directives"] = metadata["directives"]
+        updated += 1
+        dir_names = [d.get("selector", "") for d in comp["directives"]]
+        print(f"    → {comp['import_statement']} | classes: {comp['component_classes']} | directives: {dir_names}")
+
+    _save_catalog(design_system, catalog)
+    print(f"\nEnriched {updated} component(s), skipped {skipped}")
+    print(f"Catalog saved: design_systems/{design_system}_catalog.json\n")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -270,8 +413,21 @@ def build_knowledge(design_system: str) -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python doc_knowledge_builder.py <design_system>")
-        print("  e.g. python doc_knowledge_builder.py primeng")
+        print("Usage: python doc_knowledge_builder.py <design_system> [--enrich-catalog] [--all] [--overwrite]")
+        print("  default            Build utility class knowledge ({ds}_knowledge.json)")
+        print("  --enrich-catalog   Populate import/directive metadata in {ds}_catalog.json")
+        print("  --all              Run both modes")
+        print("  --overwrite        Re-extract even if fields already exist")
         sys.exit(1)
 
-    build_knowledge(sys.argv[1])
+    design_system = sys.argv[1]
+    flags = set(sys.argv[2:])
+    overwrite = "--overwrite" in flags
+
+    if "--enrich-catalog" in flags:
+        enrich_catalog_components(design_system, overwrite=overwrite)
+    elif "--all" in flags:
+        build_knowledge(design_system)
+        enrich_catalog_components(design_system, overwrite=overwrite)
+    else:
+        build_knowledge(design_system)  # unchanged default behaviour

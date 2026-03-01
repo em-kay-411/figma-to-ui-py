@@ -91,7 +91,9 @@ def build_catalog_code_gen_prompt(catalog: Dict) -> str:
         selector = c["selector"]
         desc = c.get("description", "")[:80]
         hints = ", ".join(c.get("figma_hints", [c["name"]]))
-        lines.append(f"- {hints} → <{selector}> ({desc})")
+        dir_selectors = [d["selector"] for d in c.get("directives", []) if d.get("selector")]
+        dir_note = f" [directives: {', '.join(dir_selectors)}]" if dir_selectors else ""
+        lines.append(f"- {hints} → <{selector}> ({desc}){dir_note}")
     return "\n".join(lines)
 
 
@@ -2178,6 +2180,63 @@ This visual analysis takes precedence for styling."""
 # STEP 4b: REFINE TYPOGRAPHY
 # ============================================================================
 
+def _rewrite_ts_imports(
+    ts_content: str,
+    import_path_prefix: str,
+    ds_import_statements: List[str],
+    component_classes: List[str],
+    all_ds_class_names: set,
+) -> str:
+    """Rewrite TypeScript: replace DS imports, fix @Component.imports array.
+
+    Keeps @angular/* and other non-DS import lines intact.
+    Drops stale DS import lines (matched by import_path_prefix in the from-path).
+    Inserts correct sorted DS import statements.
+    Rebuilds imports:[...] keeping non-DS class names + adding component_classes.
+    """
+    lines = ts_content.splitlines()
+    non_ds_imports, body_lines = [], []
+    past_imports = False
+
+    for line in lines:
+        stripped = line.strip()
+        if not past_imports and stripped.startswith("import "):
+            # Keep non-DS imports (Angular, etc.); drop existing DS-specific imports
+            if (f"'{import_path_prefix}/" not in line and
+                    f'"{import_path_prefix}/' not in line):
+                non_ds_imports.append(line)
+        else:
+            past_imports = True
+            body_lines.append(line)
+
+    body_str = "\n".join(body_lines)
+
+    # Rebuild imports: [...] — keep non-DS class names, append component_classes
+    m = re.search(r'imports:\s*\[([^\]]*)\]', body_str, re.DOTALL)
+    if m:
+        existing = [c.strip() for c in m.group(1).split(',') if c.strip()]
+        keep = [c for c in existing if c not in all_ds_class_names]
+    else:
+        keep = []
+    if "CommonModule" not in keep:
+        keep.insert(0, "CommonModule")
+
+    seen = set(keep)
+    for cls in component_classes:
+        if cls not in seen:
+            keep.append(cls)
+            seen.add(cls)
+
+    body_str = re.sub(
+        r'imports:\s*\[([^\]]*)\]',
+        f'imports: [{", ".join(keep)}]',
+        body_str,
+        flags=re.DOTALL,
+    )
+
+    ds_lines = sorted(ds_import_statements)
+    return "\n".join(non_ds_imports + [""] + ds_lines + [""] + body_str.splitlines())
+
 def refine_typography_node(state: AgentState) -> AgentState:
     """Step 4b: Post-process — replace inline typography with classes."""
     METRICS.start_step("refine_typography")
@@ -2223,6 +2282,104 @@ def refine_typography_node(state: AgentState) -> AgentState:
         unresolved_nodes=generated.unresolved_nodes,
     )
     METRICS.end_step("refine_typography")
+    return state
+
+
+# ============================================================================
+# STEP 4c: FIX IMPORTS / DIRECTIVES
+# ============================================================================
+
+def fix_imports_directives_node(state: AgentState) -> AgentState:
+    """Step 4c: Deterministically fix TS imports and @Component.imports from catalog.
+
+    1. Collects used DS selectors from ds_components_used.
+    2. Scans the HTML file for directive attribute selectors (e.g. pButton, pInputText).
+    3. Looks up import_statement and component_classes for each match in the catalog.
+    4. Rewrites the TypeScript file with exact import lines and @Component.imports array.
+
+    Skips gracefully if no catalog entries have import_statement populated
+    (e.g. custom DS catalog that hasn't filled in the new fields yet).
+    """
+    METRICS.start_step("fix_imports")
+    generated = state.get("generated")
+    if not generated or not generated.files:
+        METRICS.end_step("fix_imports")
+        return state
+
+    catalog_entries = state.get("ds_catalog_entries") or []
+    if not any(e.get("import_statement") for e in catalog_entries):
+        METRICS.end_step("fix_imports")
+        return state
+
+    ds_config = state.get("ds_config") or {}
+    import_path_prefix = ds_config.get("import_path", "")
+    entry_by_selector = {e["selector"]: e for e in catalog_entries if e.get("selector")}
+
+    all_ds_class_names = {
+        cls for e in catalog_entries for cls in e.get("component_classes", [])
+    }
+
+    html_file = next((f for f in generated.files if f.file_type == "html"), None)
+    ts_file = next((f for f in generated.files if f.file_type == "typescript"), None)
+    if not ts_file:
+        METRICS.end_step("fix_imports")
+        return state
+
+    used_selectors = {
+        m.ds_selector for m in (generated.ds_components_used or [])
+        if m.ds_selector and m.ds_selector != "native"
+    }
+
+    import_statements: set = set()
+    component_classes: list = []
+    seen_classes: set = set()
+
+    def _collect(entry: Dict):
+        stmt = entry.get("import_statement")
+        if stmt:
+            import_statements.add(stmt)
+        for cls in entry.get("component_classes", []):
+            if cls not in seen_classes:
+                component_classes.append(cls)
+                seen_classes.add(cls)
+
+    # Pass 1: components identified by DS mapper
+    for sel in used_selectors:
+        if sel in entry_by_selector:
+            _collect(entry_by_selector[sel])
+
+    # Pass 2: directives found in HTML (e.g. pButton, pInputText as attributes)
+    if html_file:
+        for entry in catalog_entries:
+            for directive in entry.get("directives", []):
+                dir_sel = directive.get("selector", "")
+                if dir_sel and re.search(r'\b' + re.escape(dir_sel) + r'\b', html_file.content):
+                    _collect(entry)
+                    break  # one directive match per entry is sufficient
+
+    if not import_statements:
+        METRICS.end_step("fix_imports")
+        return state
+
+    new_ts = _rewrite_ts_imports(
+        ts_file.content, import_path_prefix,
+        list(import_statements), component_classes, all_ds_class_names,
+    )
+
+    new_files = [
+        GeneratedFile(path=f.path, content=new_ts, file_type=f.file_type)
+        if f.file_type == "typescript" else f
+        for f in generated.files
+    ]
+    state["generated"] = GeneratedAngularArtifact(
+        component_name=generated.component_name,
+        files=new_files,
+        ds_components_used=generated.ds_components_used,
+        imports=component_classes,
+        unresolved_nodes=generated.unresolved_nodes,
+    )
+    print(f"fix_imports: {len(import_statements)} DS import(s), classes: {component_classes}")
+    METRICS.end_step("fix_imports")
     return state
 
 
@@ -2428,6 +2585,7 @@ def create_workflow() -> StateGraph:
     workflow.add_node("map_to_ds", map_to_design_system_node)
     workflow.add_node("generate_code", generate_angular_code_node)
     workflow.add_node("refine_typography", refine_typography_node)
+    workflow.add_node("fix_imports", fix_imports_directives_node)
     workflow.add_node("validate", validate_node)
     workflow.add_node("repair", repair_node)
 
@@ -2436,7 +2594,8 @@ def create_workflow() -> StateGraph:
     workflow.add_edge("build_ir", "map_to_ds")
     workflow.add_edge("map_to_ds", "generate_code")
     workflow.add_edge("generate_code", "refine_typography")
-    workflow.add_edge("refine_typography", "validate")
+    workflow.add_edge("refine_typography", "fix_imports")
+    workflow.add_edge("fix_imports", "validate")
     workflow.add_conditional_edges(
         "validate",
         should_repair,
