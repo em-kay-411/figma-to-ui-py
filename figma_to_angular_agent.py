@@ -842,7 +842,7 @@ def ingest_figma_node(state: AgentState) -> AgentState:
 
         # Misc
         for key in ["interactions", "boundVariables", "componentPropertyReferences",
-                    "clipsContent", "scrollBehavior"]:
+                    "clipsContent", "scrollBehavior", "componentProperties"]:
             if key in node:
                 cleaned["properties"][key] = node[key]
 
@@ -1505,6 +1505,31 @@ def _build_component_hierarchy_context(ir_tree: List[Dict], mappings: List,
             "properties": ir_node.get("properties", {}),
             "styling": ir_node.get("styling", {}),
         }
+        # Resolve HTML classes and directives from catalog
+        resolved_classes: List[str] = []
+        resolved_directives: List[str] = []
+
+        ds_comp = mapping.get("ds_component", "")
+        if ds_comp and ds_comp != "native":
+            cat_entry = DS_CATALOG_ENTRY_MAP.get(ds_comp.lower()) or {}
+            # Base classes — always applied regardless of variant
+            resolved_classes = list(cat_entry.get("base_classes", []))
+            # Variant classes — matched from Figma componentProperties
+            variant_map = cat_entry.get("variant_class_map", {})
+            comp_props = ir_node.get("properties", {}).get("componentProperties", {})
+            for prop_data in comp_props.values():
+                if isinstance(prop_data, dict) and prop_data.get("type") == "VARIANT":
+                    val = prop_data.get("value", "").lower().strip()
+                    if val in variant_map:
+                        resolved_classes.extend(variant_map[val])
+            # Directives — all selectors from the catalog entry's directives list
+            resolved_directives = [
+                d["selector"] for d in cat_entry.get("directives", []) if d.get("selector")
+            ]
+
+        context_node["resolved_classes"] = resolved_classes
+        context_node["resolved_directives"] = resolved_directives
+
         if ir_node.get("children"):
             context_node["children"] = [
                 build_node_context(child, depth + 1)
@@ -2090,6 +2115,12 @@ GENERATE:
 2. HTML Template - MUST include ALL text and structure from the design:
 - Use {ds_name} components for every UI element where a matching component exists
 - For ds_component="native" nodes: use the ds_selector value directly as the HTML tag
+- For each node, resolved_classes and resolved_directives are pre-computed from the catalog:
+  - If resolved_classes is non-empty: apply them as the element's class attribute
+    (e.g. <button class="lmn-btn lmn-btn-primary">)
+  - If resolved_directives is non-empty: emit each as a bare attribute on the element
+    (e.g. <button mtButton class="lmn-btn lmn-btn-primary">)
+  - These values are authoritative — use them exactly, do not guess or add extra classes
 - Include ALL text content from the design
 - Use utility classes from the {ds_name} documentation (listed above) for layout, spacing, and color
 - Use flexbox fallback classes "flex-row"/"flex-column" ONLY if no {ds_name} layout utility class was found

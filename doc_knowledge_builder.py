@@ -66,6 +66,11 @@ Extract:
 1. The exact TypeScript import statement to include in an Angular component file.
 2. The Angular module/class names to add to the @Component imports array.
 3. Any attribute directive selectors this module exports (e.g. pButton, pInputText), with a brief description.
+4. CSS classes ALWAYS applied to the element regardless of variant (e.g. ["lmn-btn"]).
+   Use empty array [] if the component is a custom element tag that handles its own styling.
+5. A map from variant/modifier/size name → additional CSS classes for that variant.
+   Use lowercase keys matching what a Figma variant value would be (e.g. "primary", "large").
+   Use empty object {{}} if variants are communicated via component inputs (e.g. [severity]="primary").
 
 Return ONLY this JSON:
 {{
@@ -73,13 +78,24 @@ Return ONLY this JSON:
   "component_classes": ["XModule"],
   "directives": [
     {{"selector": "xDirective", "description": "One-line description"}}
-  ]
+  ],
+  "base_classes": ["lmn-btn"],
+  "variant_class_map": {{
+    "primary":   ["lmn-btn-primary"],
+    "secondary": ["lmn-btn-secondary"],
+    "large":     ["lmn-btn-lg"],
+    "small":     ["lmn-btn-sm"]
+  }}
 }}
 Rules:
 - import_statement: single exact import line for this specific component
 - component_classes: array of Angular class name strings only
 - directives: attribute selectors used in HTML markup (not component tags)
 - If no directives, use []
+- base_classes: CSS classes applied to the native HTML element itself (not component inputs)
+- variant_class_map: keys lowercase; values are arrays of CSS class strings
+- If no base classes, use []
+- If no variant classes, use {{}}
 Output ONLY valid JSON."""
 
 EXTRACTION_USER_TEMPLATE = """\
@@ -262,7 +278,7 @@ def _extract_angular_metadata_from_doc(
     """
     if not doc_text.strip():
         print(f"    Skipping '{name}' — empty doc content")
-        return {"import_statement": "", "component_classes": [], "directives": []}
+        return {"import_statement": "", "component_classes": [], "directives": [], "base_classes": [], "variant_class_map": {}}
 
     user_content = COMPONENT_METADATA_TEMPLATE.format(
         name=name,
@@ -286,12 +302,14 @@ def _extract_angular_metadata_from_doc(
             "import_statement": result.get("import_statement", ""),
             "component_classes": result.get("component_classes", []),
             "directives": result.get("directives", []),
+            "base_classes": result.get("base_classes", []),
+            "variant_class_map": result.get("variant_class_map", {}),
         }
     except json.JSONDecodeError as exc:
         print(f"    Warning: JSON parse error for '{name}': {exc}")
     except Exception as exc:
         print(f"    Warning: LLM call failed for '{name}': {exc}")
-    return {"import_statement": "", "component_classes": [], "directives": []}
+    return {"import_statement": "", "component_classes": [], "directives": [], "base_classes": [], "variant_class_map": {}}
 
 
 def enrich_catalog_components(design_system: str, overwrite: bool = False) -> None:
@@ -322,7 +340,7 @@ def enrich_catalog_components(design_system: str, overwrite: bool = False) -> No
         if not name:
             continue
 
-        if not overwrite and comp.get("import_statement"):
+        if not overwrite and comp.get("import_statement") and "base_classes" in comp:
             print(f"  [{name}] skipped (already populated; use --overwrite to redo)")
             skipped += 1
             continue
@@ -346,9 +364,11 @@ def enrich_catalog_components(design_system: str, overwrite: bool = False) -> No
         comp["import_statement"] = metadata["import_statement"]
         comp["component_classes"] = metadata["component_classes"]
         comp["directives"] = metadata["directives"]
+        comp["base_classes"] = metadata["base_classes"]
+        comp["variant_class_map"] = metadata["variant_class_map"]
         updated += 1
         dir_names = [d.get("selector", "") for d in comp["directives"]]
-        print(f"    → {comp['import_statement']} | classes: {comp['component_classes']} | directives: {dir_names}")
+        print(f"    → {comp['import_statement']} | base_classes: {comp['base_classes']} | variant_map keys: {list(comp['variant_class_map'].keys())}")
 
     _save_catalog(design_system, catalog)
     print(f"\nEnriched {updated} component(s), skipped {skipped}")
