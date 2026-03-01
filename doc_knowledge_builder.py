@@ -71,6 +71,12 @@ Extract:
 5. A map from variant/modifier/size name → additional CSS classes for that variant.
    Use lowercase keys matching what a Figma variant value would be (e.g. "primary", "large").
    Use empty object {{}} if variants are communicated via component inputs (e.g. [severity]="primary").
+6. A one-sentence inner_html_note describing what, if anything, goes inside the component's tags.
+   Examples:
+     - "Pass options via [options] input (string[]); no inner tags needed."
+     - "Use native <button> elements with mtSegment directive as direct children."
+     - "Use ng-content named slots (header, content, footer) with native HTML."
+     - "" (empty string) if the component is self-contained with no inner markup.
 
 Return ONLY this JSON:
 {{
@@ -85,7 +91,8 @@ Return ONLY this JSON:
     "secondary": ["lmn-btn-secondary"],
     "large":     ["lmn-btn-lg"],
     "small":     ["lmn-btn-sm"]
-  }}
+  }},
+  "inner_html_note": "Pass options via [options] input; no inner tags needed."
 }}
 Rules:
 - import_statement: single exact import line for this specific component
@@ -96,6 +103,7 @@ Rules:
 - variant_class_map: keys lowercase; values are arrays of CSS class strings
 - If no base classes, use []
 - If no variant classes, use {{}}
+- inner_html_note: single sentence; use "" if no inner markup is needed
 Output ONLY valid JSON."""
 
 EXTRACTION_USER_TEMPLATE = """\
@@ -278,7 +286,7 @@ def _extract_angular_metadata_from_doc(
     """
     if not doc_text.strip():
         print(f"    Skipping '{name}' — empty doc content")
-        return {"import_statement": "", "component_classes": [], "directives": [], "base_classes": [], "variant_class_map": {}}
+        return {"import_statement": "", "component_classes": [], "directives": [], "base_classes": [], "variant_class_map": {}, "inner_html_note": ""}
 
     user_content = COMPONENT_METADATA_TEMPLATE.format(
         name=name,
@@ -304,12 +312,13 @@ def _extract_angular_metadata_from_doc(
             "directives": result.get("directives", []),
             "base_classes": result.get("base_classes", []),
             "variant_class_map": result.get("variant_class_map", {}),
+            "inner_html_note": result.get("inner_html_note", ""),
         }
     except json.JSONDecodeError as exc:
         print(f"    Warning: JSON parse error for '{name}': {exc}")
     except Exception as exc:
         print(f"    Warning: LLM call failed for '{name}': {exc}")
-    return {"import_statement": "", "component_classes": [], "directives": [], "base_classes": [], "variant_class_map": {}}
+    return {"import_statement": "", "component_classes": [], "directives": [], "base_classes": [], "variant_class_map": {}, "inner_html_note": ""}
 
 
 def enrich_catalog_components(design_system: str, overwrite: bool = False) -> None:
@@ -340,7 +349,7 @@ def enrich_catalog_components(design_system: str, overwrite: bool = False) -> No
         if not name:
             continue
 
-        if not overwrite and comp.get("import_statement") and "base_classes" in comp:
+        if not overwrite and comp.get("import_statement") and "base_classes" in comp and "inner_html_note" in comp:
             print(f"  [{name}] skipped (already populated; use --overwrite to redo)")
             skipped += 1
             continue
@@ -366,9 +375,9 @@ def enrich_catalog_components(design_system: str, overwrite: bool = False) -> No
         comp["directives"] = metadata["directives"]
         comp["base_classes"] = metadata["base_classes"]
         comp["variant_class_map"] = metadata["variant_class_map"]
+        comp["inner_html_note"] = metadata["inner_html_note"]
         updated += 1
-        dir_names = [d.get("selector", "") for d in comp["directives"]]
-        print(f"    → {comp['import_statement']} | base_classes: {comp['base_classes']} | variant_map keys: {list(comp['variant_class_map'].keys())}")
+        print(f"    → {comp['import_statement']} | base_classes: {comp['base_classes']} | inner: '{comp['inner_html_note']}'")
 
     _save_catalog(design_system, catalog)
     print(f"\nEnriched {updated} component(s), skipped {skipped}")

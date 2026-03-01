@@ -29,6 +29,27 @@ from doc_scraper import DocScraper
 # Load environment variables from .env file
 load_dotenv()
 
+# Standard HTML element names — used to detect directive-based DS components
+# (catalog entries whose selector is a native tag, e.g. "button" or "input")
+_NATIVE_HTML_TAGS: frozenset = frozenset({
+    "a", "abbr", "address", "article", "aside", "audio", "b", "blockquote",
+    "br", "button", "canvas", "caption", "cite", "code", "col", "colgroup",
+    "data", "datalist", "dd", "del", "details", "dfn", "dialog", "div", "dl",
+    "dt", "em", "embed", "fieldset", "figcaption", "figure", "footer", "form",
+    "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "i", "iframe", "img",
+    "input", "ins", "kbd", "label", "legend", "li", "main", "map", "mark",
+    "menu", "meter", "nav", "ol", "optgroup", "option", "output", "p",
+    "picture", "pre", "progress", "q", "s", "samp", "section", "select",
+    "small", "source", "span", "strong", "sub", "summary", "sup", "table",
+    "tbody", "td", "template", "textarea", "tfoot", "th", "thead", "time",
+    "tr", "u", "ul", "video",
+})
+
+# Delimiters used in Figma layer names to separate component/variant tokens
+# e.g.  "Button / Primary / Large"  →  ["Button", "Primary", "Large"]
+#        "btn-primary-lg"            →  ["btn", "primary", "lg"]
+_VARIANT_TOKEN_RE = re.compile(r'[/\-_\s,|]+')
+
 # ============================================================================
 # CONFIGURATION & PREREQUISITES
 # ============================================================================
@@ -86,14 +107,44 @@ def _build_ds_catalog_from_catalog(catalog: Dict) -> Dict:
 def build_catalog_code_gen_prompt(catalog: Dict) -> str:
     """Build the component mapping guide section for code generation from a catalog."""
     name = catalog.get("name", "Design System")
-    lines = [f"{name.upper()} COMPONENT MAPPING GUIDE - Use these aggressively:"]
+    custom_tags: List[str] = []
+    directive_lines: List[str] = []
+    component_lines: List[str] = []
+
     for c in catalog.get("components", []):
         selector = c["selector"]
         desc = c.get("description", "")[:80]
         hints = ", ".join(c.get("figma_hints", [c["name"]]))
         dir_selectors = [d["selector"] for d in c.get("directives", []) if d.get("selector")]
         dir_note = f" [directives: {', '.join(dir_selectors)}]" if dir_selectors else ""
-        lines.append(f"- {hints} → <{selector}> ({desc}){dir_note}")
+        note = c.get("inner_html_note", "")
+        inner_note = f" | inner: {note}" if note else ""
+
+        if selector.lower() in _NATIVE_HTML_TAGS:
+            # Directive-based: native HTML element + DS directives/classes
+            directive_lines.append(
+                f"- {hints} → <{selector}> (native HTML + {dir_note.strip()} + resolved_classes) ({desc}){inner_note}"
+            )
+        else:
+            custom_tags.append(selector)
+            component_lines.append(f"- {hints} → <{selector}> ({desc}){dir_note}{inner_note}")
+
+    lines = [f"{name.upper()} COMPONENT MAPPING GUIDE - Use these aggressively:"]
+    lines.extend(component_lines)
+
+    if directive_lines:
+        lines.append("")
+        lines.append("DIRECTIVE-BASED COMPONENTS (use native HTML tag + directives from resolved_directives):")
+        lines.extend(directive_lines)
+
+    # Whitelist: the ONLY non-HTML custom element tags allowed
+    if custom_tags:
+        lines.append("")
+        lines.append(f"ALLOWED CUSTOM ELEMENT TAGS — COMPLETE WHITELIST (every {name} tag you may use):")
+        lines.append("  " + "  ".join(f"<{t}>" for t in custom_tags))
+        lines.append("DO NOT use any other custom element tag. NEVER invent child tags like")
+        lines.append("<mt-option>, <mt-segment>, <p-item>, <ds-child>, or any unlisted variant.")
+
     return "\n".join(lines)
 
 
@@ -923,8 +974,12 @@ def _create_compact_tree_representation(node: Dict, max_depth: int = 10) -> Dict
     }
     if node.get("layout"):
         compact["layout"] = node["layout"]
-    if node.get("properties", {}).get("text"):
-        compact["text"] = node["properties"]["text"]
+    props = node.get("properties", {})
+    if props.get("text"):
+        compact["text"] = props["text"]
+    # Preserve componentProperties so variant data survives IR generation
+    if props.get("componentProperties"):
+        compact["componentProperties"] = props["componentProperties"]
     if node.get("styling"):
         styling = node["styling"]
         compact_styling = {}
@@ -1481,7 +1536,99 @@ def _build_design_structure_for_codegen(figma_json: Dict, ir_tree: List[Dict],
     return {"name": "Unknown", "type": "container", "children": []}
 
 
+def _extract_variant_tokens(
+    node_name: str,
+    ir_props: Dict,
+    raw_figma_node: Optional[Dict],
+) -> List[str]:
+    """Collect variant descriptor tokens from all available sources.
+
+    Priority order:
+    1. componentProperties from the IR node (preserved from Figma via compact tree)
+    2. componentProperties from the raw Figma node (reliable fallback)
+    3. The Figma layer name, split on / - _ space delimiters
+
+    Returns a deduplicated list of lowercase tokens (≥2 chars, in discovery order).
+    """
+    seen: set = set()
+    tokens: List[str] = []
+
+    def add(t: str) -> None:
+        t = t.lower().strip()
+        if t and len(t) >= 2 and t not in seen:
+            seen.add(t)
+            tokens.append(t)
+
+    # Sources 1 & 2: VARIANT-type componentProperties
+    for source in (ir_props, raw_figma_node or {}):
+        cp = source.get("componentProperties", {}) if source else {}
+        for prop_data in cp.values():
+            if isinstance(prop_data, dict) and prop_data.get("type") == "VARIANT":
+                val = prop_data.get("value", "").strip()
+                if val:
+                    add(val)
+
+    # Source 3: layer name parts (e.g. "Button / Primary / Large" → primary, large)
+    for part in _VARIANT_TOKEN_RE.split(node_name):
+        add(part.strip())
+
+    return tokens
+
+
+def _match_variant_classes(
+    tokens: List[str],
+    variant_map: Dict[str, List[str]],
+) -> List[str]:
+    """Match variant tokens against the catalog's variant_class_map.
+
+    Three-tier matching (each catalog key used at most once):
+      Tier 1 — Exact:       token == catalog_key
+      Tier 2 — Word match:  token is a whole word inside catalog_key
+      Tier 3 — Substring:   token contained in catalog_key (or vice versa),
+                            only for tokens/keys ≥ 4 chars
+
+    Returns the accumulated list of CSS class strings.
+    """
+    if not variant_map or not tokens:
+        return []
+
+    # Pre-normalise keys once
+    norm: Dict[str, List[str]] = {k.lower(): v for k, v in variant_map.items()}
+    used_keys: set = set()
+    result: List[str] = []
+
+    # ── Tier 1: exact match ──────────────────────────────────────────────────
+    for token in tokens:
+        if token in norm and token not in used_keys:
+            result.extend(norm[token])
+            used_keys.add(token)
+
+    # ── Tier 2: word-boundary match ──────────────────────────────────────────
+    for token in tokens:
+        for key_lower, classes in norm.items():
+            if key_lower in used_keys:
+                continue
+            key_words = set(_VARIANT_TOKEN_RE.split(key_lower))
+            if token in key_words:
+                result.extend(classes)
+                used_keys.add(key_lower)
+
+    # ── Tier 3: substring match (tokens/keys ≥ 4 chars) ─────────────────────
+    for token in tokens:
+        if len(token) < 4:
+            continue
+        for key_lower, classes in norm.items():
+            if key_lower in used_keys:
+                continue
+            if token in key_lower or (len(key_lower) >= 4 and key_lower in token):
+                result.extend(classes)
+                used_keys.add(key_lower)
+
+    return result
+
+
 def _build_component_hierarchy_context(ir_tree: List[Dict], mappings: List,
+                                       figma_lookup: Optional[Dict] = None,
                                        max_depth: int = 5) -> List[Dict]:
     """Build a context object representing the component hierarchy for code generation."""
     mapping_by_id = {}
@@ -1505,30 +1652,37 @@ def _build_component_hierarchy_context(ir_tree: List[Dict], mappings: List,
             "properties": ir_node.get("properties", {}),
             "styling": ir_node.get("styling", {}),
         }
-        # Resolve HTML classes and directives from catalog
+        # Resolve HTML classes, directives, and inner_html_note from catalog
         resolved_classes: List[str] = []
         resolved_directives: List[str] = []
+        inner_html_note: str = ""
 
         ds_comp = mapping.get("ds_component", "")
         if ds_comp and ds_comp != "native":
             cat_entry = DS_CATALOG_ENTRY_MAP.get(ds_comp.lower()) or {}
             # Base classes — always applied regardless of variant
             resolved_classes = list(cat_entry.get("base_classes", []))
-            # Variant classes — matched from Figma componentProperties
+            # Variant classes — multi-source, 3-tier matching
             variant_map = cat_entry.get("variant_class_map", {})
-            comp_props = ir_node.get("properties", {}).get("componentProperties", {})
-            for prop_data in comp_props.values():
-                if isinstance(prop_data, dict) and prop_data.get("type") == "VARIANT":
-                    val = prop_data.get("value", "").lower().strip()
-                    if val in variant_map:
-                        resolved_classes.extend(variant_map[val])
+            if variant_map:
+                raw_node = (figma_lookup or {}).get(node_id)
+                tokens = _extract_variant_tokens(
+                    node_name=ir_node.get("name", ""),
+                    ir_props=ir_node.get("properties", {}),
+                    raw_figma_node=raw_node,
+                )
+                resolved_classes.extend(_match_variant_classes(tokens, variant_map))
             # Directives — all selectors from the catalog entry's directives list
             resolved_directives = [
                 d["selector"] for d in cat_entry.get("directives", []) if d.get("selector")
             ]
+            # Inner HTML guidance from catalog
+            inner_html_note = cat_entry.get("inner_html_note", "")
 
         context_node["resolved_classes"] = resolved_classes
         context_node["resolved_directives"] = resolved_directives
+        if inner_html_note:
+            context_node["inner_html_note"] = inner_html_note
 
         if ir_node.get("children"):
             context_node["children"] = [
@@ -2051,6 +2205,13 @@ def generate_angular_code_node(state: AgentState) -> AgentState:
     code_gen_mappings_section = build_catalog_code_gen_prompt(catalog) if catalog else ""
     import_example_section = build_catalog_import_example(catalog) if catalog else ""
 
+    # Build the exhaustive whitelist of allowed custom element selectors for the system prompt
+    _custom_selectors = [
+        c["selector"] for c in (catalog.get("components", []) if catalog else [])
+        if c.get("selector") and c["selector"].lower() not in _NATIVE_HTML_TAGS
+    ]
+    allowed_tags_str = "  ".join(f"<{s}>" for s in _custom_selectors) if _custom_selectors else "(none)"
+
     # Build research context section for the prompt (Phase 1 output)
     utility_classes_section = ""
     if utility_classes_context:
@@ -2121,6 +2282,21 @@ GENERATE:
   - If resolved_directives is non-empty: emit each as a bare attribute on the element
     (e.g. <button mtButton class="lmn-btn lmn-btn-primary">)
   - These values are authoritative — use them exactly, do not guess or add extra classes
+- DIRECTIVE-BASED COMPONENTS: When ds_selector is a native HTML element (button, input, select, etc.)
+  and resolved_directives is non-empty, use the native tag + directives + classes. Do NOT wrap in a
+  custom element. Example: <button mtButton class="mt-btn mt-btn-primary">Label</button>
+- If a node has an inner_html_note in component_hierarchy_with_ds_mappings, follow it exactly
+  for the component's inner content
+
+CRITICAL — TAG RESTRICTIONS (read carefully):
+- The ONLY {ds_name} custom element tags you may use are: {allowed_tags_str}
+- NEVER invent child component tags. If a tag is not in the list above, do NOT use it.
+  Bad examples: <mt-segment>, <mt-option>, <p-item>, <ds-tab-item> — these are hallucinations.
+- For components that manage their own inner content (selects, dropdowns, segmented controls,
+  autocompletes, tab groups): pass items/options as @Input() arrays or objects — do NOT
+  add inner component tags or option elements. Close the tag with no children, or use
+  only native HTML inside if the inner_html_note explicitly says to.
+
 - Include ALL text content from the design
 - Use utility classes from the {ds_name} documentation (listed above) for layout, spacing, and color
 - Use flexbox fallback classes "flex-row"/"flex-column" ONLY if no {ds_name} layout utility class was found
@@ -2161,7 +2337,8 @@ This visual analysis takes precedence for styling."""
         design_json = json.dumps(design_structure)[:Config.MAX_JSON_SIZE]
 
     available_ds_components = list(DS_CATALOG.get("components", {}).keys())
-    component_hierarchy = _build_component_hierarchy_context(ir_tree, mappings)
+    figma_lookup = _build_figma_node_lookup(figma_json) if figma_json else {}
+    component_hierarchy = _build_component_hierarchy_context(ir_tree, mappings, figma_lookup=figma_lookup)
 
     context: Dict[str, Any] = {
         "component_name": root_name,
