@@ -3,7 +3,7 @@
 Runner script for Figma-to-Angular agent.
 
 Usage:
-    python run_agent.py <design_system_name> [screenshot.png|screenshot.jpg] [--fast]
+    python run_agent.py <design_system_name> [screenshot.png|screenshot.jpg] [--fast] [--test-project PATH]
 
 Examples:
     python run_agent.py primeng
@@ -11,6 +11,7 @@ Examples:
     python run_agent.py primeng /path/to/screenshot.jpg
     python run_agent.py primeng --fast
     python run_agent.py primeng my_design.png --fast
+    python run_agent.py primeng --test-project /path/to/angular/app
 
 The design_system_name maps to:
     design_systems/<name>_catalog.json
@@ -26,6 +27,11 @@ If no screenshot argument is given, the script falls back to figma_screenshots.j
         chunk size (100 vs 50). Tier 1 threshold stays at 70 — only high-confidence
         DS matches are emitted. Use for large designs where speed matters more than
         maximising DS component coverage.
+
+--test-project PATH
+        After generation, deploy the generated files into the Angular project at PATH
+        and run `ng build` in a fix loop until the build succeeds or max attempts are
+        reached. Exit code 0 on build success, 1 on failure.
 """
 
 import argparse
@@ -84,6 +90,15 @@ def main():
             "become native HTML). Tier 1 threshold unchanged at 70. "
             "Also doubles IR chunk size to 100. Use for large designs where speed matters "
             "more than maximising DS component coverage."
+        ),
+    )
+    parser.add_argument(
+        "--test-project",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Angular test project path. Deploy generated files into the project and "
+            "iteratively fix compilation errors using LLM + docs until ng build succeeds."
         ),
     )
     args = parser.parse_args()
@@ -193,11 +208,29 @@ def main():
     print(f"  Pipeline log saved to {log_path}")
 
     print(f"\nOutput directory: {output_dir.absolute()}")
-    print("\nNext steps:")
-    print("  1. Review generated files in output/generated/")
-    print("  2. Copy to your Angular project src/app/")
-    print("  3. Add required DS module imports to your app.module.ts")
-    print("  4. Run: ng serve")
+
+    if args.test_project:
+        from deploy_and_fix import deploy_and_fix
+        catalog_data = None
+        if Path(catalog_path).exists():
+            with open(catalog_path) as f:
+                catalog_data = json.load(f)
+        print("\n" + "=" * 80)
+        print("DEPLOYING TO TEST PROJECT")
+        print("=" * 80)
+        ok = deploy_and_fix(
+            generated_files=result.files,
+            test_project_path=args.test_project,
+            catalog=catalog_data,
+            max_attempts=6,
+        )
+        sys.exit(0 if ok else 1)
+    else:
+        print("\nNext steps:")
+        print("  1. Review generated files in output/generated/")
+        print("  2. Copy to your Angular project src/app/")
+        print("  3. Add required DS module imports to your app.module.ts")
+        print("  4. Run: ng serve")
 
 
 if __name__ == "__main__":
