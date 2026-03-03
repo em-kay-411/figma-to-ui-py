@@ -3,12 +3,14 @@
 Runner script for Figma-to-Angular agent.
 
 Usage:
-    python run_agent.py <design_system_name> [screenshot.png|screenshot.jpg]
+    python run_agent.py <design_system_name> [screenshot.png|screenshot.jpg] [--fast]
 
 Examples:
     python run_agent.py primeng
     python run_agent.py primeng my_design.png
     python run_agent.py primeng /path/to/screenshot.jpg
+    python run_agent.py primeng --fast
+    python run_agent.py primeng my_design.png --fast
 
 The design_system_name maps to:
     design_systems/<name>_catalog.json
@@ -18,8 +20,15 @@ and fill in your components before running.
 
 If no screenshot argument is given, the script falls back to figma_screenshots.json
 (if it exists) and then to the thumbnailUrl embedded in figma_tree.json.
+
+--fast  Enable fast mode: skip Tier 2+3 LLM mapping calls (ambiguous/low-confidence
+        nodes become native HTML instead of being LLM-resolved), and double the IR
+        chunk size (100 vs 50). Tier 1 threshold stays at 70 — only high-confidence
+        DS matches are emitted. Use for large designs where speed matters more than
+        maximising DS component coverage.
 """
 
+import argparse
 import json
 import os
 import sys
@@ -52,19 +61,39 @@ def screenshot_to_figma_screenshots(image_path: str) -> dict:
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python run_agent.py <design_system_name> [screenshot.png|screenshot.jpg]")
-        print("  Example: python run_agent.py primeng")
-        print("  Example: python run_agent.py primeng my_design.png")
-        print("")
-        print("  The name maps to design_systems/<name>_catalog.json")
-        print("  Copy design_systems/template_catalog.json and fill it in if the file doesn't exist.")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="Convert a Figma design tree to an Angular component.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "design_system",
+        help="Design system name (maps to design_systems/<name>_catalog.json)",
+    )
+    parser.add_argument(
+        "screenshot",
+        nargs="?",
+        default=None,
+        help="Optional path to a screenshot PNG/JPG for styling hints",
+    )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        default=False,
+        help=(
+            "Fast mode: skip Tier 2+3 LLM mapping calls (ambiguous/low-confidence nodes "
+            "become native HTML). Tier 1 threshold unchanged at 70. "
+            "Also doubles IR chunk size to 100. Use for large designs where speed matters "
+            "more than maximising DS component coverage."
+        ),
+    )
+    args = parser.parse_args()
 
-    design_system = sys.argv[1]
+    design_system = args.design_system
     catalog_path = f"design_systems/{design_system}_catalog.json"
     print(f"Design system:  {design_system}")
     print(f"Catalog file:   {catalog_path}")
+    if args.fast:
+        print("Fast mode:      ON")
 
     # 1. Load Figma tree (required)
     print("\nLoading input files...")
@@ -82,11 +111,10 @@ def main():
 
     # Screenshot: CLI arg takes priority, then figma_screenshots.json, then nothing
     figma_screenshots = None
-    if len(sys.argv) >= 3:
-        image_arg = sys.argv[2]
+    if args.screenshot:
         try:
-            figma_screenshots = screenshot_to_figma_screenshots(image_arg)
-            print(f"  Screenshot loaded from argument: {image_arg}")
+            figma_screenshots = screenshot_to_figma_screenshots(args.screenshot)
+            print(f"  Screenshot loaded from argument: {args.screenshot}")
         except (FileNotFoundError, ValueError) as e:
             print(f"  Warning: {e} — skipping screenshot.")
     elif Path("figma_screenshots.json").exists():
@@ -104,6 +132,7 @@ def main():
         design_tokens=design_tokens,
         figma_screenshots=figma_screenshots,
         design_system=design_system,
+        fast_mode=args.fast,
     )
 
     print("files:", len(result.files))

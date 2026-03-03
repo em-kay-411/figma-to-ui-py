@@ -15,6 +15,8 @@ import re
 import base64
 import requests
 import time
+import threading
+import concurrent.futures
 from enum import Enum
 
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
@@ -67,6 +69,10 @@ class Config:
     USE_SCREENSHOT_ANALYSIS = True
     # Path to design system mappings directory
     DS_MAPPINGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "design_systems")
+    # Optimization flags
+    ENABLE_TREE_PRUNING = True   # Optimization B: prune structural noise before IR generation
+    TIER23_BATCH_SIZE = 50       # Max nodes per parallel LLM sub-batch (Tier 2+3)
+    FAST_MODE = False            # Optimization D: lower thresholds, larger chunks, no Tier 2+3 LLM
 
 
 # ============================================================================
@@ -408,83 +414,57 @@ Output ONLY valid JSON array, no markdown fences or explanation."""
     ]
 
 
-def _resolve_low_confidence_nodes(
-    low_confidence_nodes: List[Dict],
+def _resolve_uncertain_nodes_parallel(
+    uncertain_nodes: List[Dict],
     catalog_entries: List[Dict],
 ) -> List[Dict]:
-    """Per-node LLM call with full IR subtree — for nodes with very low scoring confidence (1–29)."""
-    if not low_confidence_nodes:
+    """Resolve Tier 2 + Tier 3 nodes via parallel batched LLM calls.
+
+    Splits uncertain_nodes into TIER23_BATCH_SIZE sub-batches and runs them
+    concurrently. Each thread creates its own ChatOpenAI instance so there is
+    no shared mutable state between workers (only METRICS, which is lock-protected).
+    """
+    if not uncertain_nodes:
         return []
 
-    llm = ChatOpenAI(model=Config.LLM_MODEL, temperature=0.0, api_key=Config.OPENAI_API_KEY)
-    results = []
+    batch_size = Config.TIER23_BATCH_SIZE
+    batches = [uncertain_nodes[i:i + batch_size]
+               for i in range(0, len(uncertain_nodes), batch_size)]
+    max_workers = min(8, len(batches))
+    print(f"  Resolving {len(uncertain_nodes)} nodes: {len(batches)} sub-batch(es), "
+          f"{max_workers} worker(s)")
 
-    full_catalog = [
-        {
-            "name":        c["name"],
-            "selector":    c["selector"],
-            "description": c.get("description", ""),
-            "hints":       c.get("figma_hints", []),
-            "node_types":  c.get("figma_node_types", []),
-        }
-        for c in catalog_entries
-    ]
+    results_by_idx: Dict[int, List[Dict]] = {}
 
-    for item in low_confidence_nodes:
-        ir_node   = item["ir_node"]
-        node_id   = ir_node.get("id", "")
-        node_name = ir_node.get("name", "")
-
-        prompt = f"""You are mapping a Figma design node to its best design system component.
-
-## Available Components
-{json.dumps(full_catalog, indent=2)}
-
-## Node to Map
-{json.dumps({
-    "id":          node_id,
-    "name":        node_name,
-    "figma_type":  item["figma_type"],
-    "ir_type":     ir_node.get("type"),
-    "parent_name": item["parent_name"],
-    "children":    ir_node.get("children", [])[:10],
-    "properties":  ir_node.get("properties", {}),
-    "styling":     ir_node.get("styling", {}),
-    "layout":      ir_node.get("layout", ""),
-}, indent=2)}
-
-Choose the best component, or output ds_component="native" with an appropriate HTML tag
-(div, section, ul, etc.) if none fits.
-
-Output ONLY this JSON (no markdown):
-{{"id": "{node_id}", "ds_component": "<name or native>", "ds_selector": "<selector or tag>", "reasoning": "<one sentence>"}}"""
-
+    def process_batch(idx: int, batch: List[Dict]) -> tuple:
         try:
-            METRICS.record_llm_call(len(prompt), 0, "low_conf_resolution")
-            response = llm.invoke([
-                SystemMessage(content="Map UI nodes to design system components. Output ONLY valid JSON."),
-                HumanMessage(content=prompt),
-            ])
-            if METRICS.log_trace:
-                METRICS.log_trace[-1]["message"] += f" / {len(response.content)} out chars"
-            parsed = _parse_llm_json_response(response.content)
-            print(f"  Low-conf node '{node_name}' → {parsed.get('ds_component')} ({parsed.get('reasoning', '')})")
-            results.append({
-                "figma_node_id": node_id,
-                "ds_component":  parsed.get("ds_component", "native"),
-                "ds_selector":   parsed.get("ds_selector", "div"),
-                "inputs": {},
-            })
+            return idx, _resolve_ambiguous_with_llm(batch, catalog_entries)
         except Exception as exc:
-            print(f"  Warning: low-confidence resolution failed for '{node_name}': {exc}")
-            results.append({
-                "figma_node_id": node_id,
-                "ds_component":  "native",
-                "ds_selector":   _infer_native_html_tag(ir_node),
-                "inputs": {},
-            })
+            print(f"  Warning: sub-batch {idx+1} failed ({exc}), using native fallback")
+            return idx, [
+                {
+                    "figma_node_id": item["ir_node"].get("id", ""),
+                    "ds_component": "native",
+                    "ds_selector": _infer_native_html_tag(item["ir_node"]),
+                    "inputs": {},
+                }
+                for item in batch
+            ]
 
-    return results
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(process_batch, idx, batch): idx
+            for idx, batch in enumerate(batches)
+        }
+        for future in concurrent.futures.as_completed(futures):
+            idx, resolved = future.result()
+            results_by_idx[idx] = resolved
+
+    # Reconstruct in original order
+    ordered: List[Dict] = []
+    for i in range(len(batches)):
+        ordered.extend(results_by_idx.get(i, []))
+    return ordered
 
 
 # ============================================================================
@@ -495,6 +475,7 @@ class PipelineMetrics:
     """Tracks LLM call counts, character usage, step timings, and log trace."""
 
     def __init__(self):
+        self._lock = threading.Lock()
         self.reset()
 
     def reset(self):
@@ -505,10 +486,11 @@ class PipelineMetrics:
         self.log_trace: List[Dict[str, Any]] = []
 
     def record_llm_call(self, input_chars: int = 0, output_chars: int = 0, step: str = ""):
-        self.llm_calls += 1
-        self.llm_total_input_chars += input_chars
-        self.llm_total_output_chars += output_chars
-        self._log(step or "llm_call", f"LLM call #{self.llm_calls}: {input_chars} in / {output_chars} out chars")
+        with self._lock:
+            self.llm_calls += 1
+            self.llm_total_input_chars += input_chars
+            self.llm_total_output_chars += output_chars
+            self._log(step or "llm_call", f"LLM call #{self.llm_calls}: {input_chars} in / {output_chars} out chars")
 
     def start_step(self, step_name: str):
         self.step_timings[step_name] = {"start": time.time(), "end": 0.0}
@@ -521,6 +503,8 @@ class PipelineMetrics:
             self._log(step_name, f"Step completed in {elapsed:.2f}s")
 
     def _log(self, step: str, message: str):
+        # Callers that already hold self._lock may call this directly.
+        # Callers that do NOT hold the lock must acquire it first.
         self.log_trace.append({
             "step": step,
             "message": message,
@@ -835,6 +819,73 @@ def load_ds_knowledge(design_system: str) -> Optional[Dict]:
 # WORKFLOW NODES
 # ============================================================================
 
+# Regex for detecting spacer/padding/separator layer names (used in pruning)
+_SPACER_NAME_RE = re.compile(
+    r'\b(spacer|padding|gap|separator)\b', re.IGNORECASE
+)
+
+
+def _prune_figma_tree(node: Dict) -> Optional[Dict]:
+    """Recursively prune structural noise from a cleaned Figma tree.
+
+    Rules (post-order — children pruned before parent):
+    1. Remove RECTANGLE/VECTOR nodes matching spacer name pattern or < 4px on both axes.
+    2. Remove FRAME nodes matching spacer name pattern.
+    3. Collapse FRAME/GROUP with 1 child and no visual styling
+       (no fills, strokes, effects, cornerRadius, clipsContent, text).
+    4. Deduplicate sibling groups of >=4 children with same type+child-type signature;
+       keep first + annotate _repeat_count.
+    """
+    node_type = node.get("type", "")
+    node_name = node.get("name", "") or ""
+    styling   = node.get("styling") or {}
+    props     = node.get("properties") or {}
+
+    # Rule 1: remove spacer shapes
+    if node_type in ("RECTANGLE", "VECTOR"):
+        if _SPACER_NAME_RE.search(node_name):
+            return None
+        bbox = props.get("absoluteBoundingBox") or {}
+        if bbox.get("width", 999) < 4 and bbox.get("height", 999) < 4:
+            return None
+
+    # Rule 2: remove spacer frames
+    if node_type == "FRAME" and _SPACER_NAME_RE.search(node_name):
+        return None
+
+    # Recurse into children first
+    pruned_children = [
+        r for c in node.get("children", [])
+        if (r := _prune_figma_tree(c)) is not None
+    ]
+    node = {**node, "children": pruned_children}
+
+    # Rule 3: collapse single-child wrappers with no visual styling
+    is_visual = (
+        styling.get("fills") or styling.get("strokes") or styling.get("effects")
+        or styling.get("cornerRadius") or props.get("clipsContent") or props.get("text")
+    )
+    if node_type in ("FRAME", "GROUP") and len(pruned_children) == 1 and not is_visual:
+        return pruned_children[0]
+
+    # Rule 4: deduplicate repeated sibling groups
+    if len(pruned_children) >= 4:
+        def sig(c: Dict) -> str:
+            return c.get("type", "") + "|" + "|".join(
+                gc.get("type", "") for gc in c.get("children", [])[:5]
+            )
+        first_type = pruned_children[0].get("type", "")
+        first_sig  = sig(pruned_children[0])
+        if all(c.get("type") == first_type and sig(c) == first_sig
+               for c in pruned_children[1:]):
+            kept = {**pruned_children[0], "_repeat_count": len(pruned_children) - 1}
+            node = {**node, "children": [kept]}
+            print(f"    Deduplicated '{node_name}': 1 of {len(pruned_children)} "
+                  f"{first_type} kept (_repeat_count={len(pruned_children)-1})")
+
+    return node
+
+
 def ingest_figma_node(state: AgentState) -> AgentState:
     """Step 1: Clean and normalize Figma JSON."""
     METRICS.start_step("ingest_figma")
@@ -941,6 +992,44 @@ def ingest_figma_node(state: AgentState) -> AgentState:
     return state
 
 
+def prune_figma_tree_node(state: AgentState) -> AgentState:
+    """Step 1b: Prune structural noise before IR generation. Pure Python — no LLM.
+
+    Skipped when Config.ENABLE_TREE_PRUNING is False.
+    Runs up to 5 passes until the node count stabilises (handles cascading collapses).
+    """
+    if not Config.ENABLE_TREE_PRUNING:
+        return state
+
+    METRICS.start_step("prune_figma_tree")
+    figma_tree = state["figma_json"]
+
+    def count_nodes(n: Dict) -> int:
+        return 1 + sum(count_nodes(c) for c in n.get("children", []))
+
+    before = count_nodes(figma_tree)
+    print(f"Tree pruning: {before} nodes before...")
+
+    pruned = figma_tree
+    for pass_num in range(5):
+        next_pruned = _prune_figma_tree(pruned)
+        if next_pruned is None:
+            break
+        after_pass = count_nodes(next_pruned)
+        if after_pass == count_nodes(pruned):
+            pruned = next_pruned
+            break
+        pruned = next_pruned
+        print(f"  Pass {pass_num + 1}: {after_pass} nodes")
+
+    after = count_nodes(pruned)
+    reduction = 100 * (before - after) // before if before else 0
+    print(f"  Pruned {before - after} nodes ({reduction}% reduction). Remaining: {after}")
+    state["figma_json"] = pruned
+    METRICS.end_step("prune_figma_tree")
+    return state
+
+
 def _flatten_figma_tree(node: Dict, parent_id: Optional[str] = None, depth: int = 0) -> List[Dict]:
     """Flatten Figma tree into a list of nodes with parent references."""
     nodes = []
@@ -1021,6 +1110,8 @@ def _parse_llm_json_response(content: str) -> Any:
 def build_ir_node(state: AgentState) -> AgentState:
     """Step 2: Convert Figma JSON to IR using chunked processing for large trees."""
     METRICS.start_step("build_ir")
+    if Config.FAST_MODE:
+        Config.MAX_NODES_PER_CHUNK = 100
     llm = ChatOpenAI(model=Config.LLM_MODEL, temperature=Config.LLM_TEMPERATURE)
 
     figma_tree = state["figma_json"]
@@ -1139,12 +1230,42 @@ def _count_ir_nodes(ir_nodes: List[Dict]) -> int:
     return count
 
 
-def _process_chunked_tree(llm, flat_nodes: List[Dict], original_tree: Dict, state: AgentState) -> List[Dict]:
-    """Process large Figma tree in chunks and reconstruct the hierarchy."""
-    chunks = _chunk_nodes(flat_nodes, Config.MAX_NODES_PER_CHUNK)
-    print(f"Split into {len(chunks)} chunks")
+def _process_single_chunk(
+    chunk: List[Dict],
+    chunk_idx: int,
+    total_chunks: int,
+    system_prompt: str,
+) -> tuple:
+    """Process one flat-node chunk via a dedicated LLM instance.
 
-    all_ir_nodes = {}
+    Returns (chunk_idx, node_dict, error_msg_or_None).
+    Creating a per-thread ChatOpenAI instance avoids any shared mutable state.
+    """
+    print(f"Processing chunk {chunk_idx+1}/{total_chunks} ({len(chunk)} nodes)...")
+    llm = ChatOpenAI(
+        model=Config.LLM_MODEL,
+        temperature=Config.LLM_TEMPERATURE,
+        api_key=Config.OPENAI_API_KEY,
+    )
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=f"Convert these {len(chunk)} Figma nodes to IR:\n\n"
+                              f"{json.dumps(chunk, indent=2)}"),
+    ]
+    try:
+        response = llm.invoke(messages)
+        METRICS.record_llm_call(len(json.dumps(chunk)), len(response.content), "build_ir")
+        chunk_ir = _parse_llm_json_response(response.content)
+        if isinstance(chunk_ir, dict):
+            chunk_ir = [chunk_ir]
+        return chunk_idx, {n["id"]: n for n in chunk_ir if n.get("id")}, None
+    except Exception as exc:
+        return chunk_idx, {}, f"Chunk {chunk_idx+1}/{total_chunks} failed: {exc}"
+
+
+def _process_chunked_tree(llm, flat_nodes: List[Dict], original_tree: Dict, state: AgentState) -> List[Dict]:
+    """Process large Figma tree in parallel chunks and reconstruct the hierarchy."""
+    chunks = _chunk_nodes(flat_nodes, Config.MAX_NODES_PER_CHUNK)
 
     system_prompt = """You are an expert at analyzing Figma design nodes and converting them to semantic UI components.
 
@@ -1164,28 +1285,28 @@ Note: These are flattened nodes from a larger tree. Each node has:
 Output as JSON array with ONE entry per input node.
 IMPORTANT: Output ONLY valid JSON, no markdown. Include ALL input nodes in output."""
 
-    for i, chunk in enumerate(chunks):
-        print(f"Processing chunk {i+1}/{len(chunks)} ({len(chunk)} nodes)...")
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=f"Convert these {len(chunk)} Figma nodes to IR:\n\n{json.dumps(chunk, indent=2)}"),
-        ]
-        try:
-            chunk_input_chars = len(json.dumps(chunk))
-            response = llm.invoke(messages)
-            METRICS.record_llm_call(chunk_input_chars, len(response.content), "build_ir")
-            chunk_ir = _parse_llm_json_response(response.content)
-            if isinstance(chunk_ir, dict):
-                chunk_ir = [chunk_ir]
-            for ir_node in chunk_ir:
-                if ir_node.get("id"):
-                    all_ir_nodes[ir_node["id"]] = ir_node
-        except Exception as e:
-            print(f"Warning: Chunk {i+1} failed: {str(e)}")
-            state["validation_errors"].append(
-                ValidationError(file_path="ir_tree", error_type="chunk_error",
-                                message=f"Chunk {i+1} processing failed: {str(e)}")
-            )
+    max_workers = min(8, len(chunks))
+    print(f"Split into {len(chunks)} chunk(s), {max_workers} parallel worker(s)")
+
+    all_ir_nodes: Dict[str, Dict] = {}
+    chunk_errors: List[str] = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_process_single_chunk, chunk, idx, len(chunks), system_prompt): idx
+            for idx, chunk in enumerate(chunks)
+        }
+        for future in concurrent.futures.as_completed(futures):
+            chunk_idx, node_dict, error = future.result()
+            all_ir_nodes.update(node_dict)
+            if error:
+                chunk_errors.append(error)
+
+    for msg in chunk_errors:
+        print(f"Warning: {msg}")
+        state["validation_errors"].append(
+            ValidationError(file_path="ir_tree", error_type="chunk_error", message=msg)
+        )
 
     print(f"Reconstructing hierarchy from {len(all_ir_nodes)} IR nodes...")
     return _reconstruct_ir_hierarchy(all_ir_nodes, original_tree)
@@ -1238,10 +1359,11 @@ def map_to_design_system_node(state: AgentState) -> AgentState:
 
     TEXT nodes are always classified as native HTML (h1–h6 / p) — no LLM involved.
     Non-text nodes are scored against the catalog using 6 signals, then tiered:
-      - score ≥ 70  → definite deterministic match
-      - score 30–69 → batch LLM call with rich context (_resolve_ambiguous_with_llm)
-      - score 1–29  → per-node LLM call with full subtree (_resolve_low_confidence_nodes)
-      - score = 0   → native HTML fallback
+      - score ≥ 70  → definite deterministic match  (≥ 40 in fast mode)
+      - score 30–69 → Tier 2: queued for parallel batch LLM resolution
+      - score 1–29  → Tier 3: queued for parallel batch LLM resolution
+      - score = 0   → native HTML fallback  (fast mode: everything below threshold is native)
+    Tier 2 + Tier 3 nodes are merged and resolved via _resolve_uncertain_nodes_parallel.
     """
     METRICS.start_step("map_to_ds")
 
@@ -1320,7 +1442,7 @@ def map_to_design_system_node(state: AgentState) -> AgentState:
                 "ds_selector": best_entry["selector"],
                 "inputs": {},
             })
-        elif scored and scored[0][0] >= 30:
+        elif not Config.FAST_MODE and scored and scored[0][0] >= 30:
             # Tier 2: medium ambiguity → batch LLM with rich context
             ambiguous_nodes.append({
                 "ir_node":     ir_node,
@@ -1328,8 +1450,8 @@ def map_to_design_system_node(state: AgentState) -> AgentState:
                 "parent_name": parent_name_map.get(node_id, ""),
                 "top3":        scored[:3],
             })
-        elif scored:
-            # Tier 3: low confidence → per-node LLM with full subtree
+        elif not Config.FAST_MODE and scored:
+            # Tier 3: low confidence → parallel batched LLM
             low_confidence_nodes.append({
                 "ir_node":     ir_node,
                 "figma_type":  figma_orig_node.get("type", "") if figma_orig_node else "",
@@ -1337,7 +1459,7 @@ def map_to_design_system_node(state: AgentState) -> AgentState:
                 "top3":        scored[:3],
             })
         else:
-            # Score = 0 → native HTML
+            # Score = 0, or fast mode below threshold → native HTML immediately
             definite_mappings.append({
                 "figma_node_id": node_id,
                 "ds_component": "native",
@@ -1345,17 +1467,14 @@ def map_to_design_system_node(state: AgentState) -> AgentState:
                 "inputs": {},
             })
 
-    # ── Tier 2: Batch resolve ambiguous nodes ─────────────────────────────
-    if ambiguous_nodes:
-        print(f"Resolving {len(ambiguous_nodes)} ambiguous nodes with LLM batch call...")
-        ambiguous_resolved = _resolve_ambiguous_with_llm(ambiguous_nodes, catalog_entries)
-        definite_mappings.extend(ambiguous_resolved)
-
-    # ── Tier 3: Per-node resolve low-confidence nodes ─────────────────────
-    if low_confidence_nodes:
-        print(f"Resolving {len(low_confidence_nodes)} low-confidence nodes with per-node LLM calls...")
-        resolved_lc = _resolve_low_confidence_nodes(low_confidence_nodes, catalog_entries)
-        definite_mappings.extend(resolved_lc)
+    # ── Tier 2 + 3: Merged parallel batch resolution ──────────────────────
+    all_uncertain = ambiguous_nodes + low_confidence_nodes
+    if all_uncertain:
+        print(f"Resolving {len(ambiguous_nodes)} ambiguous + {len(low_confidence_nodes)} "
+              f"low-confidence nodes via parallel batched LLM calls...")
+        definite_mappings.extend(
+            _resolve_uncertain_nodes_parallel(all_uncertain, catalog_entries)
+        )
 
     # ── Build DSComponentMapping objects ──────────────────────────────────
     try:
@@ -2789,6 +2908,7 @@ def create_workflow() -> StateGraph:
     workflow = StateGraph(AgentState)
 
     workflow.add_node("ingest_figma", ingest_figma_node)
+    workflow.add_node("prune_figma_tree", prune_figma_tree_node)   # Step 1b: structural pruning
     workflow.add_node("build_ir", build_ir_node)
     workflow.add_node("map_to_ds", map_to_design_system_node)
     workflow.add_node("generate_code", generate_angular_code_node)
@@ -2798,7 +2918,8 @@ def create_workflow() -> StateGraph:
     workflow.add_node("repair", repair_node)
 
     workflow.set_entry_point("ingest_figma")
-    workflow.add_edge("ingest_figma", "build_ir")
+    workflow.add_edge("ingest_figma", "prune_figma_tree")   # → pruning (was → build_ir)
+    workflow.add_edge("prune_figma_tree", "build_ir")        # → IR generation
     workflow.add_edge("build_ir", "map_to_ds")
     workflow.add_edge("map_to_ds", "generate_code")
     workflow.add_edge("generate_code", "refine_typography")
@@ -3044,6 +3165,7 @@ def run_figma_to_angular(
     design_tokens: Optional[Dict] = None,
     figma_screenshots: Optional[Dict[str, str]] = None,
     design_system: str = "",
+    fast_mode: bool = False,
 ) -> GeneratedAngularArtifact:
     """Run the Figma → Angular pipeline.
 
@@ -3054,11 +3176,21 @@ def run_figma_to_angular(
         figma_screenshots: Optional dict of screenshot URLs.
         design_system: Name of the design system catalog
                        (e.g., 'primeng' → loads design_systems/primeng_catalog.json).
+        fast_mode: If True, skips Tier 2+3 LLM mapping calls (ambiguous and
+                   low-confidence nodes fall back to native HTML instead of being
+                   LLM-resolved) and doubles the IR chunk size to 100. The Tier 1
+                   threshold remains at 70 so only high-confidence DS mappings are
+                   kept. Suitable for large designs where speed matters more than
+                   maximising DS component coverage.
 
     Raises:
         ValueError: If design_system is empty or no catalog file is found.
     """
     METRICS.reset()
+    Config.FAST_MODE = fast_mode
+    if fast_mode:
+        print("Fast mode enabled: Tier 2+3 LLM mapping calls skipped, IR chunk size doubled. "
+              "Ambiguous/low-confidence nodes will use native HTML.")
 
     global DESIGN_TOKENS, DS_CATALOG, DOC_KNOWLEDGE, DS_CATALOG_ENTRY_MAP, DS_DOCS_DIR
     DESIGN_TOKENS = design_tokens or {}
