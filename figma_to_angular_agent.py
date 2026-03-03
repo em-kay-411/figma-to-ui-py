@@ -1107,6 +1107,30 @@ def _parse_llm_json_response(content: str) -> Any:
     return json.loads(content)
 
 
+def _extract_ir_nodes(data: Any) -> List[Dict]:
+    """Extract a list of IR node dicts from an LLM response.
+
+    The LLM is asked to return a JSON array but sometimes wraps it in an
+    object, e.g. {"nodes": [...]} or {"ir_tree": [...]}.  Without this
+    unwrapping the whole wrapper dict ends up as a single fake node, causing
+    every downstream read of "type", "name", and "layout" to return None.
+
+    Handles three cases:
+      - Already a list  → return as-is
+      - A dict with a recognisable list-valued key → return that list
+      - A dict with no recognisable key → treat the dict as a single node
+    """
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("nodes", "ir_tree", "tree", "components", "result", "data", "children"):
+            val = data.get(key)
+            if isinstance(val, list) and val:
+                return val
+        # Single-node dict — wrap it
+        return [data]
+    return []
+
 def build_ir_node(state: AgentState) -> AgentState:
     """Step 2: Convert Figma JSON to IR using chunked processing for large trees."""
     METRICS.start_step("build_ir")
@@ -1199,9 +1223,7 @@ IMPORTANT:
         METRICS.record_llm_call(input_chars, len(response.content), "build_ir")
         print(f"LLM response received. Length: {len(response.content)} chars")
 
-        ir_data = _parse_llm_json_response(response.content)
-        if isinstance(ir_data, dict):
-            ir_data = [ir_data]
+        ir_data = _extract_ir_nodes(_parse_llm_json_response(response.content))
 
         total_nodes = _count_ir_nodes(ir_data)
         print(f"Generated IR with {total_nodes} total nodes")
@@ -1255,9 +1277,7 @@ def _process_single_chunk(
     try:
         response = llm.invoke(messages)
         METRICS.record_llm_call(len(json.dumps(chunk)), len(response.content), "build_ir")
-        chunk_ir = _parse_llm_json_response(response.content)
-        if isinstance(chunk_ir, dict):
-            chunk_ir = [chunk_ir]
+        chunk_ir = _extract_ir_nodes(_parse_llm_json_response(response.content))
         return chunk_idx, {n["id"]: n for n in chunk_ir if n.get("id")}, None
     except Exception as exc:
         return chunk_idx, {}, f"Chunk {chunk_idx+1}/{total_chunks} failed: {exc}"
@@ -1273,8 +1293,8 @@ Convert these Figma nodes to semantic UI primitives (IR - Intermediate Represent
 
 For EACH node, identify:
 1. Semantic type: button, text, input, card, icon, image, container, list, header, footer, nav, form, divider, avatar, badge, chip, dialog, menu, tab, table, link
-2. Layout type: flex-row, flex-column, grid, absolute, stack
-3. Key properties based on the node data
+2. Layout type (string): flex-row, flex-column, grid, absolute, stack
+3. Key properties (text content, colors, sizing, spacing)
 
 Note: These are flattened nodes from a larger tree. Each node has:
 - id: unique identifier
@@ -1282,8 +1302,26 @@ Note: These are flattened nodes from a larger tree. Each node has:
 - depth: nesting level
 - has_children: whether it has child nodes
 
-Output as JSON array with ONE entry per input node.
-IMPORTANT: Output ONLY valid JSON, no markdown. Include ALL input nodes in output."""
+Output as a JSON array with ONE entry per input node. Each entry MUST use this exact structure:
+[
+  {
+    "id": "1:2",
+    "type": "container",
+    "name": "MainContainer",
+    "layout": "flex-column",
+    "properties": {},
+    "constraints": {},
+    "styling": {"backgroundColor": "#fff"},
+    "children": []
+  }
+]
+
+IMPORTANT:
+- Output ONLY valid JSON, no markdown formatting or explanations
+- Include ALL input nodes in output — never skip any
+- "layout" must be a string (flex-row, flex-column, grid, absolute, stack), never a dict
+- "children" is always an empty array [] — hierarchy is reconstructed separately
+- "properties" must include "text" for TEXT nodes (e.g. {"text": "Hello"})"""
 
     max_workers = min(8, len(chunks))
     print(f"Split into {len(chunks)} chunk(s), {max_workers} parallel worker(s)")
