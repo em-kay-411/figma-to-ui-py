@@ -1700,10 +1700,9 @@ def _extract_variant_tokens(
 ) -> List[str]:
     """Collect variant descriptor tokens from all available sources.
 
-    Priority order:
-    1. componentProperties from the IR node (preserved from Figma via compact tree)
-    2. componentProperties from the raw Figma node (reliable fallback)
-    3. The Figma layer name, split on / - _ space delimiters
+    Walks every string value inside componentProperties (any type, not just VARIANT)
+    and the full IR properties dict, regardless of nesting depth.  Also splits the
+    Figma layer name on common delimiters.
 
     Returns a deduplicated list of lowercase tokens (≥2 chars, in discovery order).
     """
@@ -1716,16 +1715,31 @@ def _extract_variant_tokens(
             seen.add(t)
             tokens.append(t)
 
-    # Sources 1 & 2: VARIANT-type componentProperties
-    for source in (ir_props, raw_figma_node or {}):
-        cp = source.get("componentProperties", {}) if source else {}
-        for prop_data in cp.values():
-            if isinstance(prop_data, dict) and prop_data.get("type") == "VARIANT":
-                val = prop_data.get("value", "").strip()
-                if val:
-                    add(val)
+    def collect_strings(obj: Any) -> None:
+        """Recursively extract every string leaf, skip pure-numeric strings."""
+        if isinstance(obj, str):
+            if obj.strip() and not obj.strip().lstrip("-").replace(".", "", 1).isdigit():
+                add(obj)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                collect_strings(v)
+        elif isinstance(obj, (list, tuple)):
+            for item in obj:
+                collect_strings(item)
 
-    # Source 3: layer name parts (e.g. "Button / Primary / Large" → primary, large)
+    # Source 1: componentProperties from the IR node (all types)
+    collect_strings((ir_props or {}).get("componentProperties", {}))
+
+    # Source 2: componentProperties from the raw Figma node (all types)
+    collect_strings((raw_figma_node or {}).get("componentProperties", {}))
+
+    # Source 3: remaining IR properties (skip layout/geometry keys to reduce noise)
+    _SKIP_PROPS = {"text", "componentProperties", "absoluteBoundingBox", "absoluteRenderBounds"}
+    for key, val in (ir_props or {}).items():
+        if key not in _SKIP_PROPS:
+            collect_strings(val)
+
+    # Source 4: layer name parts (e.g. "Button / Primary / Large" → primary, large)
     for part in _VARIANT_TOKEN_RE.split(node_name):
         add(part.strip())
 
@@ -1835,6 +1849,10 @@ def _build_component_hierarchy_context(ir_tree: List[Dict], mappings: List,
             ]
             # Inner HTML guidance from catalog
             inner_html_note = cat_entry.get("inner_html_note", "")
+            # Inputs from catalog — overrides the empty mapping default
+            catalog_inputs = cat_entry.get("inputs", [])
+            if catalog_inputs:
+                context_node["inputs"] = {inp: "" for inp in catalog_inputs}
 
         context_node["resolved_classes"] = resolved_classes
         context_node["resolved_directives"] = resolved_directives
