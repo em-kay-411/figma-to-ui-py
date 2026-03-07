@@ -21,6 +21,14 @@ class Session:
     ir_tree: Optional[List] = None
     ds_catalog_entries: Optional[List] = None
     chat_history: List[Dict] = field(default_factory=list)
+    # DS context for multi-turn continuity (Enhancement F)
+    doc_research_cache: Dict[str, str] = field(default_factory=dict)
+    ds_coverage_history: List[dict] = field(default_factory=list)
+    change_log: List[dict] = field(default_factory=list)
+    pending_suggestion: Optional[dict] = None
+    pending_unresolved: List[dict] = field(default_factory=list)
+    phase1_research_context: Optional[str] = None
+    last_intent: Optional[dict] = None
 
 
 class SessionStore:

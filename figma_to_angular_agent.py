@@ -7,7 +7,7 @@
 #   - Ambiguous nodes resolved with a single batch LLM call
 #   - Only 1–2 LLM calls per run (IR gen + optional repair)
 
-from typing import TypedDict, List, Dict, Any, Optional
+from typing import TypedDict, List, Dict, Any, Optional, Literal
 from dataclasses import dataclass, field
 import json
 import os
@@ -152,6 +152,68 @@ def build_catalog_code_gen_prompt(catalog: Dict) -> str:
         lines.append("<mt-option>, <mt-segment>, <p-item>, <ds-child>, or any unlisted variant.")
 
     return "\n".join(lines)
+
+
+def build_ds_enforcement_system_prompt(
+    catalog: Dict,
+    design_system: str,
+    intent_category: Optional[str] = None,
+) -> str:
+    """Build a shared DS enforcement block for codegen, refine, and repair prompts."""
+    ds_name = catalog.get("name", design_system)
+    components = catalog.get("components", [])
+    ds_prefix = catalog.get("prefix", "")
+
+    all_selectors = [c["selector"] for c in components if c.get("selector")]
+    custom_selectors = [s for s in all_selectors if s.lower() not in _NATIVE_HTML_TAGS]
+
+    selector_list = "\n".join(f"  - {s}" for s in all_selectors) or "  (none)"
+    custom_list = "  ".join(f"<{s}>" for s in custom_selectors) if custom_selectors else "(none)"
+
+    intent_rule = ""
+    if intent_category == "DATA_LOGIC_BEHAVIOR":
+        intent_rule = (
+            "\n### Intent-specific rule:\n"
+            "Only modify TypeScript logic. Do NOT touch the HTML template or SCSS."
+        )
+    elif intent_category == "VISUAL_STYLE":
+        intent_rule = (
+            "\n### Intent-specific rule:\n"
+            "Focus on SCSS and utility class changes. Preserve component structure and selectors."
+        )
+    elif intent_category == "LAYOUT_STRUCTURAL":
+        intent_rule = (
+            "\n### Intent-specific rule:\n"
+            "Focus on layout properties (flex, grid, padding, gap). Keep component selectors unchanged."
+        )
+    elif intent_category == "ACCESSIBILITY_PROPERTY":
+        intent_rule = (
+            "\n### Intent-specific rule:\n"
+            "Add ARIA attributes and semantic HTML improvements. Do not change visual output."
+        )
+
+    prefix_note = f"- NEVER invent child tags like <{ds_prefix}-item>, <{ds_prefix}-option> (unless listed above)\n" if ds_prefix else ""
+
+    return f"""## DESIGN SYSTEM ENFORCEMENT RULES (Mandatory)
+
+You are working with the {ds_name} design system. The following rules are NON-NEGOTIABLE:
+
+### Allowed component selectors (exhaustive list):
+{selector_list}
+
+### Custom element tag whitelist:
+{custom_list}
+
+### FORBIDDEN patterns:
+- NEVER emit a custom element tag not in the whitelist above
+- NEVER use style="..." inline attributes for typography or layout
+- NEVER use native <select>, <input type="date">, <button> where a DS equivalent exists
+{prefix_note}
+### SCSS rules:
+- Write ONLY layout-level properties: flex, grid, padding, gap, margin, background-color, border, box-shadow
+- Typography → use utility classes or leave to DS default styles
+- Pixel overrides ONLY when no DS utility class exists
+{intent_rule}"""
 
 
 def build_catalog_import_example(catalog: Dict) -> str:
@@ -785,6 +847,7 @@ class AgentState(TypedDict):
     repair_attempt: int
     messages: List[Any]
     ds_knowledge: Optional[Dict[str, Any]]   # pre-built utility class knowledge
+    phase1_research_context: Optional[str]   # Phase 1 doc research output
 
 
 # ============================================================================
@@ -2346,6 +2409,9 @@ def generate_angular_code_node(state: AgentState) -> AgentState:
     else:
         print("Phase 1 skipped (no knowledge.json and no DS components mapped).")
 
+    # Store Phase 1 context in state for session persistence (Enhancement I/F)
+    state["phase1_research_context"] = utility_classes_context
+
     # Derive component name
     root_name = "GeneratedComponent"
     raw_name = (figma_json.get("name") if figma_json else None) or (ir_tree[0].get("name") if ir_tree else None)
@@ -2893,17 +2959,13 @@ def repair_node(state: AgentState) -> AgentState:
     catalog = ds_config.get("_catalog", {})
     ds_name = ds_config.get("name", "the design system")
 
-    repair_mapping_hints = ""
-    if catalog.get("components"):
-        repair_mapping_hints = f"\n\nIMPORTANT - MAXIMIZE {ds_name} component usage:\n"
-        for c in catalog["components"][:15]:
-            repair_mapping_hints += f"- {', '.join(c.get('figma_hints', [c['name']]))} → <{c['selector']}>\n"
-        repair_mapping_hints += (
-            f"\n## TEXT NODE RULES (ABSOLUTE):\n"
-            f"- type='text' nodes use native HTML tags (h1–h6, p) from ds_selector — NEVER a DS component\n"
-            f"- Every {ds_name} module used in the template MUST be imported in the TypeScript file\n"
-            f"- Populate ds_components_used with ALL {ds_name} components used"
-        )
+    enforcement = build_ds_enforcement_system_prompt(catalog, ds_name) if catalog else ""
+    text_node_rule = (
+        f"\n## TEXT NODE RULES (ABSOLUTE):\n"
+        f"- type='text' nodes use native HTML tags (h1–h6, p) — NEVER a DS component\n"
+        f"- Every {ds_name} module used in the template MUST be imported in the TypeScript file\n"
+        f"- Populate ds_components_used with ALL {ds_name} components used"
+    )
 
     repair_prompt = f"""Previous generation had errors:
 
@@ -2917,11 +2979,15 @@ Current generated files:
 
 Fix ALL errors and regenerate complete Angular component code.
 Generate proper TypeScript, HTML template, and SCSS files.
-{repair_mapping_hints}"""
+{text_node_rule}"""
+
+    repair_messages = [HumanMessage(content=repair_prompt)]
+    if enforcement:
+        repair_messages = [SystemMessage(content=enforcement)] + repair_messages
 
     try:
         repair_input_chars = len(repair_prompt)
-        repaired = structured_llm.invoke([HumanMessage(content=repair_prompt)])
+        repaired = structured_llm.invoke(repair_messages)
         METRICS.record_llm_call(
             repair_input_chars,
             sum(len(f.content) for f in repaired.files),
@@ -3119,25 +3185,368 @@ def generate_from_prompt(
     screenshot_path: Optional[str] = None,
     design_tokens: Optional[Dict] = None,
 ) -> "GeneratedAngularArtifact":
-    """Full pipeline for screenshot/prompt-only input (no Figma JSON).
+    """Backward-compatible wrapper for run_agent.py. Returns artifact only."""
+    artifact, _ = generate_angular_component(
+        design_system=design_system,
+        prompt=prompt,
+        screenshot_path=screenshot_path,
+        design_tokens=design_tokens,
+    )
+    return artifact
 
-    Synthesizes a Figma-like tree from the input, then runs the standard pipeline.
+
+def generate_angular_component(
+    design_system: str,
+    figma_json: Optional[Dict] = None,
+    screenshot_path: Optional[str] = None,
+    prompt: Optional[str] = None,
+    design_tokens: Optional[Dict] = None,
+    fast_mode: bool = False,
+) -> "tuple[GeneratedAngularArtifact, dict]":
+    """Unified entry point for all generate paths.
+
+    Accepts any combination of figma_json, screenshot_path, and prompt.
+    Returns (artifact, pipeline_metadata) where pipeline_metadata contains
+    phase1_research_context, ds_coverage, and other state for session persistence.
     """
-    print("Generating HTML from input...")
-    html, css = generate_html_from_input(prompt=prompt, screenshot_path=screenshot_path)
+    if not figma_json and not screenshot_path and not prompt:
+        raise ValueError("At least one of figma_json, screenshot_path, or prompt is required")
 
-    print("Converting HTML to synthetic Figma tree...")
-    synthetic_figma = html_to_figma_tree(html, css, name=prompt or "Generated Design")
+    if figma_json is None:
+        print("Generating HTML from input...")
+        html, css = generate_html_from_input(prompt=prompt, screenshot_path=screenshot_path)
+        print("Converting HTML to synthetic Figma tree...")
+        figma_json = html_to_figma_tree(html, css, name=prompt or "Generated Design")
 
     figma_screenshots = {"main": screenshot_path} if screenshot_path else None
 
-    return run_figma_to_angular(
-        figma_json=synthetic_figma,
+    artifact, final_state = run_figma_to_angular(
+        figma_json=figma_json,
         design_tokens=design_tokens,
         figma_screenshots=figma_screenshots,
         design_system=design_system,
+        fast_mode=fast_mode,
     )
 
+    catalog = load_ds_catalog(design_system)
+    pipeline_metadata = {
+        "phase1_research_context": final_state.get("phase1_research_context") or "",
+        "ds_coverage": compute_ds_coverage(artifact, design_system, catalog).as_dict() if catalog else {},
+    }
+    return artifact, pipeline_metadata
+
+
+# ============================================================================
+# DS COVERAGE SCORING (Enhancement E)
+# ============================================================================
+
+@dataclass
+class DSCoverageScore:
+    total_mappable_elements: int
+    ds_mapped_elements: int
+    coverage_pct: float
+    uncovered_selectors: List[str]
+
+    def as_dict(self) -> dict:
+        return {
+            "total_mappable_elements": self.total_mappable_elements,
+            "ds_mapped_elements": self.ds_mapped_elements,
+            "coverage_pct": round(self.coverage_pct, 1),
+            "uncovered_selectors": self.uncovered_selectors,
+        }
+
+
+def compute_ds_coverage(
+    artifact: "GeneratedAngularArtifact",
+    design_system: str,
+    catalog: Optional[Dict] = None,
+) -> DSCoverageScore:
+    """Compute DS coverage: ratio of mappable elements using DS components."""
+    import html.parser as _html_parser
+
+    if catalog is None:
+        catalog = load_ds_catalog(design_system)
+    if not catalog:
+        return DSCoverageScore(0, 0, 0.0, [])
+
+    ds_selectors = {c["selector"].lower() for c in catalog.get("components", [])}
+    mappable_native = {"button", "select", "input", "textarea", "table", "a"}
+
+    html_files = [
+        f for f in artifact.files
+        if f.file_type in ("html", "template") or f.path.endswith(".html")
+    ]
+
+    class _TagCounter(_html_parser.HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.total = 0
+            self.ds_count = 0
+            self.uncovered: List[str] = []
+
+        def handle_starttag(self, tag, attrs):
+            tag_lower = tag.lower()
+            if tag_lower in ds_selectors:
+                self.total += 1
+                self.ds_count += 1
+            elif tag_lower in mappable_native:
+                self.total += 1
+                self.uncovered.append(tag_lower)
+
+    total = 0
+    ds_count = 0
+    uncovered: List[str] = []
+    for html_file in html_files:
+        counter = _TagCounter()
+        try:
+            counter.feed(html_file.content)
+        except Exception:
+            pass
+        total += counter.total
+        ds_count += counter.ds_count
+        uncovered.extend(counter.uncovered)
+
+    pct = (ds_count / total * 100) if total > 0 else 0.0
+    return DSCoverageScore(
+        total_mappable_elements=total,
+        ds_mapped_elements=ds_count,
+        coverage_pct=pct,
+        uncovered_selectors=list(set(uncovered)),
+    )
+
+
+# ============================================================================
+# INTENT CLASSIFICATION (Enhancement A)
+# ============================================================================
+
+@dataclass
+class IntentClassification:
+    category: str  # LAYOUT_STRUCTURAL | VISUAL_STYLE | COMPONENT_SWAP | DATA_LOGIC_BEHAVIOR | ACCESSIBILITY_PROPERTY | AMBIGUOUS
+    new_components_requested: List[str]
+    affected_selectors: List[str]
+    requires_catalog_lookup: bool
+    requires_doc_research: bool
+    confidence: float
+
+    def as_dict(self) -> dict:
+        return {
+            "category": self.category,
+            "new_components_requested": self.new_components_requested,
+            "affected_selectors": self.affected_selectors,
+            "requires_catalog_lookup": self.requires_catalog_lookup,
+            "requires_doc_research": self.requires_doc_research,
+            "confidence": self.confidence,
+        }
+
+
+_INTENT_HEURISTICS: List[tuple] = [
+    ("DATA_LOGIC_BEHAVIOR", re.compile(
+        r"\b(method|function|service|api|logic|state|variable|emit|event|handler|click|subscribe|observable|promise|fetch|http|backend|endpoint)\b",
+        re.IGNORECASE,
+    )),
+    ("ACCESSIBILITY_PROPERTY", re.compile(
+        r"\b(aria|a11y|accessible|accessibility|role|alt|tab\s*index|focus|keyboard|screen\s*reader)\b",
+        re.IGNORECASE,
+    )),
+    ("VISUAL_STYLE", re.compile(
+        r"\b(color|colour|background|bg|font|text\s*size|bold|italic|shadow|border|radius|opacity|theme|dark|light|palette)\b",
+        re.IGNORECASE,
+    )),
+    ("LAYOUT_STRUCTURAL", re.compile(
+        r"\b(layout|align|center|right|left|flex|grid|column|row|wrap|gap|padding|margin|position|stack|inline|side)\b",
+        re.IGNORECASE,
+    )),
+    ("COMPONENT_SWAP", re.compile(
+        r"\b(add|replace|swap|change|use|insert|put|remove|delete|convert)\b.{0,30}\b"
+        r"(button|input|dropdown|select|table|dialog|modal|card|chip|badge|tab|slider|toggle|checkbox|radio|calendar|date picker|autocomplete|tree|menu|panel|accordion)\b",
+        re.IGNORECASE,
+    )),
+]
+
+
+def _extract_component_terms(prompt: str, catalog: Dict) -> List[str]:
+    """Extract DS component-related terms from a prompt."""
+    terms = []
+    prompt_lower = prompt.lower()
+    for entry in catalog.get("components", []):
+        for hint in entry.get("figma_hints", [entry.get("name", "")]):
+            if hint and hint.lower() in prompt_lower:
+                terms.append(hint)
+                break
+    return terms
+
+
+def classify_refine_intent(
+    prompt: str,
+    current_artifact: "GeneratedAngularArtifact",
+    catalog: Dict,
+) -> IntentClassification:
+    """Classify the intent of a refine prompt. Heuristics first, LLM fallback."""
+    affected = [
+        m.ds_selector for m in current_artifact.ds_components_used
+        if m.ds_component != "native"
+    ]
+
+    for category, pattern in _INTENT_HEURISTICS:
+        if pattern.search(prompt):
+            requires_lookup = category not in ("DATA_LOGIC_BEHAVIOR", "ACCESSIBILITY_PROPERTY")
+            requires_doc = category in ("COMPONENT_SWAP", "VISUAL_STYLE")
+            component_terms = _extract_component_terms(prompt, catalog)
+            return IntentClassification(
+                category=category,
+                new_components_requested=component_terms,
+                affected_selectors=affected,
+                requires_catalog_lookup=requires_lookup,
+                requires_doc_research=requires_doc,
+                confidence=0.8,
+            )
+
+    # Fallback: cheap LLM call for ambiguous cases
+    try:
+        llm = ChatOpenAI(model=Config.LLM_MODEL, temperature=0.0, api_key=Config.OPENAI_API_KEY)
+        catalog_names = [c["name"] for c in catalog.get("components", [])]
+        system = (
+            "Classify this Angular refinement request into exactly one category.\n"
+            "Categories: LAYOUT_STRUCTURAL, VISUAL_STYLE, COMPONENT_SWAP, "
+            "DATA_LOGIC_BEHAVIOR, ACCESSIBILITY_PROPERTY, AMBIGUOUS\n"
+            f"Available DS components: {', '.join(catalog_names[:20])}\n"
+            'Return JSON: {"category": "...", "new_components_requested": [...], "confidence": 0.0}'
+        )
+        resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=prompt)])
+        parsed = _parse_llm_json_response(resp.content)
+        category = parsed.get("category", "AMBIGUOUS")
+        new_comps = parsed.get("new_components_requested", [])
+        confidence = float(parsed.get("confidence", 0.5))
+        requires_lookup = category not in ("DATA_LOGIC_BEHAVIOR", "ACCESSIBILITY_PROPERTY")
+        requires_doc = category in ("COMPONENT_SWAP", "VISUAL_STYLE")
+        return IntentClassification(
+            category=category,
+            new_components_requested=new_comps,
+            affected_selectors=affected,
+            requires_catalog_lookup=requires_lookup,
+            requires_doc_research=requires_doc,
+            confidence=confidence,
+        )
+    except Exception as exc:
+        print(f"Intent classification LLM failed: {exc}")
+        component_terms = _extract_component_terms(prompt, catalog)
+        return IntentClassification(
+            category="AMBIGUOUS",
+            new_components_requested=component_terms,
+            affected_selectors=affected,
+            requires_catalog_lookup=True,
+            requires_doc_research=True,
+            confidence=0.3,
+        )
+
+
+# ============================================================================
+# CATALOG QUERY FOR INTENT (Enhancement B)
+# ============================================================================
+
+def query_catalog_for_intent(
+    prompt: str,
+    catalog: Dict,
+    new_component_terms: List[str],
+    doc_research_cache: Optional[Dict[str, str]] = None,
+) -> "tuple[List[Dict], Dict[str, str]]":
+    """Score catalog entries against requested terms. Fetch+cache API/usage docs.
+
+    Returns (top_matches, updated_doc_cache).
+    Each match dict: {selector, name, description, score, doc_text}.
+    """
+    if doc_research_cache is None:
+        doc_research_cache = {}
+
+    prompt_lower = prompt.lower()
+    scored: List[tuple] = []
+
+    for entry in catalog.get("components", []):
+        score = 0
+        hints = entry.get("figma_hints", [entry.get("name", "")])
+        for hint in hints:
+            hl = hint.lower()
+            if re.search(rf"\b{re.escape(hl)}\b", prompt_lower):
+                score += 60
+                break
+            elif hl in prompt_lower:
+                score += 40
+                break
+        for term in new_component_terms:
+            tl = term.lower()
+            if tl in entry.get("name", "").lower() or any(tl in h.lower() for h in hints):
+                score += 30
+                break
+        if score >= 30:
+            scored.append((score, entry))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    scraper = DocScraper()
+    top_matches: List[Dict] = []
+    for score, entry in scored[:3]:
+        doc_text = ""
+        for doc_type in ("api", "usage"):
+            url = entry.get("urls", {}).get(doc_type, "")
+            if not url:
+                continue
+            if url in doc_research_cache:
+                doc_text += doc_research_cache[url] + "\n"
+            else:
+                try:
+                    fetched = scraper.fetch(url)
+                    if fetched:
+                        doc_research_cache[url] = fetched
+                        doc_text += fetched + "\n"
+                except Exception as exc:
+                    print(f"  Doc fetch failed for {url}: {exc}")
+        top_matches.append({
+            "selector": entry["selector"],
+            "name": entry["name"],
+            "description": entry.get("description", ""),
+            "score": score,
+            "doc_text": doc_text[:3000],
+        })
+
+    return top_matches, doc_research_cache
+
+
+# ============================================================================
+# PROACTIVE COMPONENT SUGGESTIONS (Enhancement C)
+# ============================================================================
+
+def build_component_suggestion_response(
+    catalog: Dict,
+    top_matches: List[Dict],
+) -> "tuple[str, str, bool]":
+    """Build a suggestion string for the user from matched catalog components.
+
+    Returns (suggestion_text, chosen_selector, awaiting_confirmation).
+    awaiting_confirmation=True when confidence is low (multiple close matches, top score < 70).
+    """
+    if not top_matches:
+        return "", "", False
+
+    ds_name = catalog.get("name", "design system")
+    lines = [f"I found these {ds_name} components that match your request:"]
+    for i, match in enumerate(top_matches, 1):
+        lines.append(f"  {i}. <{match['selector']}> — {match['description'][:80]}")
+
+    best = top_matches[0]
+    if len(top_matches) == 1 or best["score"] >= 70:
+        lines.append(f"\nProceeding with <{best['selector']}> (best match).")
+        return "\n".join(lines), best["selector"], False
+    else:
+        lines.append(
+            f"\nProceeding with <{best['selector']}> (highest match). "
+            "Reply to choose a different option."
+        )
+        return "\n".join(lines), best["selector"], True
+
+
+# ============================================================================
+# REFINE WITH PROMPT (DS-aware, Enhancement A/B/C/D)
+# ============================================================================
 
 def refine_with_prompt(
     current_artifact: "GeneratedAngularArtifact",
@@ -3145,26 +3554,61 @@ def refine_with_prompt(
     design_system: str,
     component_mappings: Optional[List] = None,
     screenshot_path: Optional[str] = None,
-) -> "GeneratedAngularArtifact":
+    intent: Optional[IntentClassification] = None,
+    doc_research_cache: Optional[Dict[str, str]] = None,
+    phase1_research_context: Optional[str] = None,
+) -> "tuple[GeneratedAngularArtifact, dict]":
     """Apply a natural-language change to existing generated Angular files.
 
-    Single LLM call — does not re-run the full pipeline.
-    The DS catalog constrains which components may be used.
+    DS-aware: classifies intent, queries catalog, fetches docs, enforces guardrails.
+    Returns (artifact, updated_meta) where updated_meta contains doc_research_cache,
+    intent dict, suggestion_text, and ds_coverage.
     """
     catalog = load_ds_catalog(design_system)
     if not catalog:
         raise ValueError(f"Design system catalog not found: {design_system}")
 
-    component_guide = build_catalog_code_gen_prompt(catalog)
+    if doc_research_cache is None:
+        doc_research_cache = {}
+
+    # Classify intent (Enhancement A)
+    if intent is None:
+        intent = classify_refine_intent(prompt, current_artifact, catalog)
+
+    # Catalog lookup + doc research (Enhancement B)
+    doc_section = ""
+    suggestion_text = ""
+    if intent.requires_catalog_lookup and intent.new_components_requested:
+        top_matches, doc_research_cache = query_catalog_for_intent(
+            prompt, catalog, intent.new_components_requested, doc_research_cache
+        )
+        if top_matches:
+            suggestion_text, _, _ = build_component_suggestion_response(catalog, top_matches)
+            doc_lines = ["\n## RELEVANT COMPONENT DOCUMENTATION"]
+            for match in top_matches:
+                if match["doc_text"]:
+                    doc_lines.append(f"\n### {match['name']} (<{match['selector']}>)")
+                    doc_lines.append(match["doc_text"][:2000])
+            doc_section = "\n".join(doc_lines)
+
+    # Build shared enforcement prompt (Enhancement G)
+    enforcement = build_ds_enforcement_system_prompt(catalog, design_system, intent.category)
+
+    # Reuse Phase 1 research from generation (Enhancement F)
+    phase1_section = ""
+    if phase1_research_context:
+        phase1_section = (
+            "\n\n## GENERATION-TIME RESEARCH CONTEXT (reuse these findings)\n"
+            + phase1_research_context[:3000]
+        )
+
     current_files = {f.file_type: f.content for f in current_artifact.files}
 
     screenshot_section = ""
     if screenshot_path and Config.USE_SCREENSHOT_ANALYSIS:
         styling = analyze_screenshot_for_styling(screenshot_path, prompt)
         if styling:
-            screenshot_section = (
-                f"\n\nVisual reference:\n{json.dumps(styling, indent=2)}"
-            )
+            screenshot_section = f"\n\nVisual reference:\n{json.dumps(styling, indent=2)}"
 
     mappings_text = "\n".join(
         f"  - {m.ds_selector} ({m.ds_component})"
@@ -3178,11 +3622,14 @@ def refine_with_prompt(
         api_key=Config.OPENAI_API_KEY,
     ).with_structured_output(GeneratedAngularArtifact)
 
-    system = f"""You are an expert Angular developer using the {catalog.get('name', design_system)} design system.
-Apply the user's requested change to the Angular component. Preserve all unaffected structure.
-Only use components available in this design system:
-{component_guide}
-Return COMPLETE updated files — not diffs."""
+    system = (
+        f"You are an expert Angular developer using the {catalog.get('name', design_system)} design system.\n"
+        f"Apply the user's requested change to the Angular component. Preserve all unaffected structure.\n"
+        f"{enforcement}"
+        f"{phase1_section}"
+        f"{doc_section}\n\n"
+        "Return COMPLETE updated files — not diffs."
+    )
 
     user = f"""Component: {current_artifact.component_name}
 
@@ -3208,7 +3655,15 @@ Change requested: {prompt}"""
     result = llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
     if METRICS.log_trace:
         METRICS.log_trace[-1]["message"] += " / structured output"
-    return result
+
+    coverage = compute_ds_coverage(result, design_system, catalog)
+    updated_meta = {
+        "doc_research_cache": doc_research_cache,
+        "intent": intent.as_dict(),
+        "suggestion_text": suggestion_text,
+        "ds_coverage": coverage.as_dict(),
+    }
+    return result, updated_meta
 
 
 # ============================================================================
@@ -3222,7 +3677,7 @@ def run_figma_to_angular(
     figma_screenshots: Optional[Dict[str, str]] = None,
     design_system: str = "",
     fast_mode: bool = False,
-) -> GeneratedAngularArtifact:
+) -> "tuple[GeneratedAngularArtifact, Dict]":
     """Run the Figma → Angular pipeline.
 
     Args:
@@ -3310,6 +3765,7 @@ def run_figma_to_angular(
         "repair_attempt": 0,
         "messages": [],
         "ds_knowledge": knowledge,
+        "phase1_research_context": None,
     }
 
     print("Invoking workflow...")
@@ -3320,9 +3776,9 @@ def run_figma_to_angular(
     print(METRICS.summary())
 
     if final_state.get("generated"):
-        return final_state["generated"]
+        return final_state["generated"], final_state
 
-    return GeneratedAngularArtifact(
+    artifact = GeneratedAngularArtifact(
         component_name="failed-generation",
         files=[],
         ds_components_used=[],
@@ -3332,6 +3788,7 @@ def run_figma_to_angular(
             for err in final_state.get("validation_errors", [])
         ],
     )
+    return artifact, final_state
 
 
 if __name__ == "__main__":
@@ -3344,7 +3801,7 @@ if __name__ == "__main__":
     with open("figma_tree.json") as f:
         figma_data = json.load(f)
 
-    result = run_figma_to_angular(
+    result, _ = run_figma_to_angular(
         figma_json=figma_data,
         design_system=sys.argv[1],
     )

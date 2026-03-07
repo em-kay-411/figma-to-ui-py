@@ -1,9 +1,11 @@
 import json
 import os
+import re
 import base64
 import tempfile
 import threading
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -14,7 +16,13 @@ from session_store import SessionStore
 from figma_to_angular_agent import (
     run_figma_to_angular,
     generate_from_prompt,
+    generate_angular_component,
     refine_with_prompt,
+    classify_refine_intent,
+    build_component_suggestion_response,
+    query_catalog_for_intent,
+    compute_ds_coverage,
+    load_ds_catalog,
     METRICS,
 )
 
@@ -49,6 +57,62 @@ class RefineRequest(BaseModel):
     prompt: str
     screenshot_base64: Optional[str] = None
 
+
+# ── Enhancement H: Conversation Router ────────────────────────────────────────
+
+@dataclass
+class ChatRouteDecision:
+    action: str  # APPLY_REFINE | CLARIFY | SUGGEST_COMPONENTS | RESOLVE_UNRESOLVED | OUT_OF_SCOPE | COVERAGE_WARNING
+    clarification_question: Optional[str] = None
+    refusal_reason: Optional[str] = None
+    intent: Optional[dict] = None
+
+
+_OUT_OF_SCOPE_PATTERN = re.compile(
+    r"\b(NgModule|app\.module|RouterModule|routing|HttpClient|backend service|"
+    r"connect to api|rest endpoint|database|auth(?:entication|orization)?)\b",
+    re.IGNORECASE,
+)
+
+
+def route_chat_message(prompt: str, session, catalog: Optional[dict]) -> ChatRouteDecision:
+    """Route an incoming refine prompt to the appropriate action."""
+    # Pending unresolved nodes awaiting clarification (Enhancement D)
+    if session.pending_unresolved:
+        return ChatRouteDecision(action="RESOLVE_UNRESOLVED")
+
+    # Out-of-scope check
+    if _OUT_OF_SCOPE_PATTERN.search(prompt):
+        return ChatRouteDecision(
+            action="OUT_OF_SCOPE",
+            refusal_reason=(
+                "This tool generates Angular component UI only. "
+                "Backend services, routing, NgModule configuration, and API integration "
+                "are out of scope."
+            ),
+        )
+
+    # Intent classification
+    if session.current_artifact and catalog:
+        try:
+            intent = classify_refine_intent(prompt, session.current_artifact, catalog)
+            if intent.category == "AMBIGUOUS" and intent.confidence < 0.5:
+                return ChatRouteDecision(
+                    action="CLARIFY",
+                    clarification_question=(
+                        "Could you clarify what you'd like to change? "
+                        "(layout, colors, components, or logic)"
+                    ),
+                    intent=intent.as_dict(),
+                )
+            return ChatRouteDecision(action="APPLY_REFINE", intent=intent.as_dict())
+        except Exception:
+            pass
+
+    return ChatRouteDecision(action="APPLY_REFINE")
+
+
+# ── API endpoints ──────────────────────────────────────────────────────────────
 
 @app.get("/design-systems")
 def list_design_systems():
@@ -92,22 +156,19 @@ def generate(
             400, "Provide at least one of figma_json, screenshot, or prompt"
         )
 
+    figma_data = None
+    if figma_json:
+        figma_data = json.loads(figma_json.file.read())
+
     screenshot_path = _save_upload_to_tempfile(screenshot) if screenshot else None
     try:
-        if figma_json:
-            figma_data = json.loads(figma_json.file.read())
-            figma_screenshots = {"main": screenshot_path} if screenshot_path else None
-            artifact = run_figma_to_angular(
-                figma_json=figma_data,
-                design_system=s.design_system,
-                figma_screenshots=figma_screenshots,
-            )
-        else:
-            artifact = generate_from_prompt(
-                design_system=s.design_system,
-                prompt=prompt,
-                screenshot_path=screenshot_path,
-            )
+        # Enhancement I: unified entry point for all generate paths
+        artifact, pipeline_meta = generate_angular_component(
+            design_system=s.design_system,
+            figma_json=figma_data,
+            screenshot_path=screenshot_path,
+            prompt=prompt,
+        )
     except Exception as e:
         raise HTTPException(500, str(e))
     finally:
@@ -115,12 +176,56 @@ def generate(
             os.unlink(screenshot_path)
 
     s.current_artifact = artifact
+    # Enhancement F: persist DS context
+    s.phase1_research_context = pipeline_meta.get("phase1_research_context") or ""
+    s.ds_coverage_history.append(pipeline_meta.get("ds_coverage", {}))
+
     if prompt:
         s.chat_history.append({"role": "user", "content": prompt})
+
+    # Enhancement C: proactive component suggestions for prompt-based generates
+    if prompt:
+        catalog = load_ds_catalog(s.design_system)
+        if catalog:
+            from figma_to_angular_agent import _extract_component_terms
+            terms = _extract_component_terms(prompt, catalog)
+            if terms:
+                top_matches, _ = query_catalog_for_intent(prompt, catalog, terms)
+                if top_matches:
+                    suggestion_text, _, _ = build_component_suggestion_response(catalog, top_matches)
+                    if suggestion_text:
+                        s.chat_history.append({
+                            "role": "assistant",
+                            "content": suggestion_text,
+                            "metadata": {"type": "component_suggestion"},
+                        })
+
     s.chat_history.append(
         {"role": "assistant", "content": f"Generated {artifact.component_name}"}
     )
-    return _artifact_response(s, artifact)
+
+    # Enhancement D: surface unresolved nodes in chat
+    if artifact.unresolved_nodes:
+        ds_name = s.design_system
+        node_list = "\n".join(
+            f"- {n}" for n in artifact.unresolved_nodes[:5]
+        )
+        notice = {
+            "role": "assistant",
+            "content": (
+                f"Generation complete. However, {len(artifact.unresolved_nodes)} element(s) "
+                f"could not be confidently mapped to a {ds_name} component:\n{node_list}\n\n"
+                "Describe what each should be and I will re-map them."
+            ),
+            "metadata": {
+                "type": "unresolved_notice",
+                "unresolved_nodes": artifact.unresolved_nodes,
+            },
+        }
+        s.chat_history.append(notice)
+        s.pending_unresolved = artifact.unresolved_nodes
+
+    return _artifact_response(s, artifact, pipeline_meta.get("ds_coverage"))
 
 
 @app.post("/sessions/{session_id}/refine")
@@ -131,16 +236,61 @@ def refine(session_id: str, body: RefineRequest):
             400, "No generated code in session — call /generate first"
         )
 
+    catalog = load_ds_catalog(s.design_system)
+
+    # Enhancement H: route the message
+    decision = route_chat_message(body.prompt, s, catalog)
+
+    if decision.action == "OUT_OF_SCOPE":
+        s.chat_history.append({"role": "user", "content": body.prompt})
+        s.chat_history.append({"role": "assistant", "content": decision.refusal_reason})
+        return {
+            "session_id": s.session_id,
+            "action": "OUT_OF_SCOPE",
+            "message": decision.refusal_reason,
+            "chat_history": s.chat_history,
+        }
+
+    if decision.action == "CLARIFY":
+        s.chat_history.append({"role": "user", "content": body.prompt})
+        s.chat_history.append({"role": "assistant", "content": decision.clarification_question})
+        return {
+            "session_id": s.session_id,
+            "action": "CLARIFY",
+            "message": decision.clarification_question,
+            "chat_history": s.chat_history,
+        }
+
+    # Reconstruct intent from routing decision if available
+    intent = None
+    if decision.intent and catalog and s.current_artifact:
+        try:
+            from figma_to_angular_agent import IntentClassification
+            d = decision.intent
+            intent = IntentClassification(
+                category=d["category"],
+                new_components_requested=d.get("new_components_requested", []),
+                affected_selectors=d.get("affected_selectors", []),
+                requires_catalog_lookup=d.get("requires_catalog_lookup", True),
+                requires_doc_research=d.get("requires_doc_research", False),
+                confidence=d.get("confidence", 0.5),
+            )
+        except Exception:
+            pass
+
     screenshot_path = None
     if body.screenshot_base64:
         screenshot_path = _decode_base64_to_tempfile(body.screenshot_base64)
     try:
-        artifact = refine_with_prompt(
+        artifact, refine_meta = refine_with_prompt(
             current_artifact=s.current_artifact,
             prompt=body.prompt,
             design_system=s.design_system,
             component_mappings=s.component_mappings,
             screenshot_path=screenshot_path,
+            intent=intent,
+            doc_research_cache=s.doc_research_cache,
+            phase1_research_context=s.phase1_research_context,
         )
     except Exception as e:
         raise HTTPException(500, str(e))
@@ -148,12 +298,34 @@ def refine(session_id: str, body: RefineRequest):
         if screenshot_path and os.path.exists(screenshot_path):
             os.unlink(screenshot_path)
 
+    # Enhancement F: update session DS context
     s.current_artifact = artifact
+    s.doc_research_cache = refine_meta.get("doc_research_cache", s.doc_research_cache)
+    s.last_intent = refine_meta.get("intent")
+    s.ds_coverage_history.append(refine_meta.get("ds_coverage", {}))
+
     s.chat_history.append({"role": "user", "content": body.prompt})
+
+    # Enhancement C: include suggestion in chat if relevant
+    suggestion = refine_meta.get("suggestion_text", "")
+    if suggestion:
+        s.chat_history.append({
+            "role": "assistant",
+            "content": suggestion,
+            "metadata": {"type": "component_suggestion"},
+        })
+
     s.chat_history.append(
         {"role": "assistant", "content": f"Refined {artifact.component_name}"}
     )
-    return _artifact_response(s, artifact)
+
+    # Enhancement D: surface new unresolved nodes post-refine
+    if artifact.unresolved_nodes:
+        s.pending_unresolved = artifact.unresolved_nodes
+    else:
+        s.pending_unresolved = []
+
+    return _artifact_response(s, artifact, refine_meta.get("ds_coverage"))
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -179,7 +351,8 @@ def _decode_base64_to_tempfile(b64: str) -> str:
         return tmp.name
 
 
-def _artifact_response(s, artifact) -> dict:
+def _artifact_response(s, artifact, ds_coverage: Optional[dict] = None) -> dict:
+    """Build the standard artifact response, including DS coverage and unresolved count."""
     return {
         "session_id": s.session_id,
         "component_name": artifact.component_name,
@@ -187,6 +360,8 @@ def _artifact_response(s, artifact) -> dict:
         "imports": artifact.imports,
         "ds_components_used": [m.model_dump() for m in artifact.ds_components_used],
         "unresolved_nodes": artifact.unresolved_nodes,
+        "unresolved_count": len(artifact.unresolved_nodes),
+        "ds_coverage": ds_coverage or {},
         "chat_history": s.chat_history,
     }
 
@@ -199,6 +374,7 @@ def _session_response(s) -> dict:
         "last_active": s.last_active.isoformat(),
         "has_generated_code": s.current_artifact is not None,
         "chat_history": s.chat_history,
+        "ds_coverage_history": s.ds_coverage_history,
         "current_files": (
             [f.model_dump() for f in s.current_artifact.files]
             if s.current_artifact

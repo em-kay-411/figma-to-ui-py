@@ -141,7 +141,7 @@ def main():
     print("\nStarting Figma-to-Angular conversion...")
     print("=" * 80)
 
-    result = run_figma_to_angular(
+    result, _ = run_figma_to_angular(
         figma_json=figma_data,
         ds_json=None,           # no longer used
         design_tokens=design_tokens,

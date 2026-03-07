@@ -29,13 +29,27 @@ An LLM-powered pipeline that converts a Figma design export into production-read
     - [doc_knowledge_builder.py](#doc_knowledge_builderpy--knowledge-base-builder)
     - [generate_figma_hints.py](#generate_figma_hintspy--hint-generator)
 13. [REST API Server](#rest-api-server)
-14. [Data Models](#data-models)
-15. [Global State](#global-state)
-16. [Caching System](#caching-system)
-17. [LLM Calls Summary](#llm-calls-summary)
-18. [Key Design Decisions](#key-design-decisions)
-19. [Adding a New Design System](#adding-a-new-design-system)
-20. [Output Files](#output-files)
+    - [Endpoints](#endpoints)
+    - [Generate Endpoint — Unified Path](#generate-endpoint--unified-path)
+    - [Refine Endpoint — DS-Aware Multi-Turn](#refine-endpoint--ds-aware-multi-turn)
+    - [Session State](#session-state)
+14. [DS-Aware Generate & Refine](#ds-aware-generate--refine)
+    - [Enhancement I — Unified Generate Function](#enhancement-i--unified-generate-function)
+    - [Enhancement G — Shared DS Enforcement Prompt](#enhancement-g--shared-ds-enforcement-prompt)
+    - [Enhancement A — Intent Classification](#enhancement-a--intent-classification)
+    - [Enhancement B — Catalog Lookup & Doc Research in Refine](#enhancement-b--catalog-lookup--doc-research-in-refine)
+    - [Enhancement C — Proactive Component Suggestions](#enhancement-c--proactive-component-suggestions)
+    - [Enhancement D — Unresolved Node Follow-up](#enhancement-d--unresolved-node-follow-up)
+    - [Enhancement E — DS Coverage Scoring](#enhancement-e--ds-coverage-scoring)
+    - [Enhancement F — Session State Enrichment](#enhancement-f--session-state-enrichment)
+    - [Enhancement H — Multi-Turn Conversation Routing](#enhancement-h--multi-turn-conversation-routing)
+15. [Data Models](#data-models)
+16. [Global State](#global-state)
+17. [Caching System](#caching-system)
+18. [LLM Calls Summary](#llm-calls-summary)
+19. [Key Design Decisions](#key-design-decisions)
+20. [Adding a New Design System](#adding-a-new-design-system)
+21. [Output Files](#output-files)
 
 ---
 
@@ -52,6 +66,8 @@ The pipeline takes a Figma JSON export and a design system catalog and produces 
 
 The catalog JSON defines every DS component: its selector, Figma layer name hints, documentation URLs, HTML classes, Angular directives, and inner content strategy. A set of one-time scripts populate the catalog automatically from live documentation.
 
+The REST API (`api.py`) wraps the pipeline in a stateful, multi-turn HTTP interface. Each session retains generated code, Phase 1 research context, DS coverage history, and chat history across multiple generate/refine turns. The refine endpoint is fully DS-aware: it classifies the intent of each request, queries the catalog for relevant components, fetches their documentation, enforces guardrails, and routes out-of-scope or ambiguous requests without invoking the LLM.
+
 ---
 
 ## High-Level Architecture
@@ -61,17 +77,22 @@ The catalog JSON defines every DS component: its selector, Figma layer name hint
 │                              INPUTS                                   │
 │                                                                       │
 │   figma_tree.json     {name}_catalog.json     screenshot (optional)  │
-│      (required)           (required)          design_tokens (optional)│
+│      (required)           (required)          prompt / design_tokens │
 └────────────┬─────────────────┬───────────────────────────────────────┘
              │                 │
              ▼                 ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│                      run_figma_to_angular()                           │
+│             generate_angular_component()  ← unified entry point      │
 │                    figma_to_angular_agent.py                          │
 │                                                                       │
-│  Loads catalog → populates module globals (DS_CATALOG,               │
-│  DS_CATALOG_ENTRY_MAP, DOC_KNOWLEDGE) → builds LangGraph workflow    │
-│  → invokes it with initial state                                     │
+│  Accepts any combo of figma_json / screenshot_path / prompt.         │
+│  Synthesises a Figma tree from prompt/screenshot when figma_json     │
+│  is absent. Calls run_figma_to_angular() → returns (artifact,        │
+│  pipeline_meta) with phase1_research_context + ds_coverage.          │
+│                                                                       │
+│  run_figma_to_angular(): loads catalog → populates module globals    │
+│  (DS_CATALOG, DS_CATALOG_ENTRY_MAP, DOC_KNOWLEDGE) → builds          │
+│  LangGraph workflow → invokes it → returns (artifact, final_state)   │
 └────────────────────────────┬─────────────────────────────────────────┘
                              │
                              ▼
@@ -308,6 +329,9 @@ generated               artifact   Generated files (Stage 4)
 validation_errors       list       Errors from Stage 5
 repair_attempt          int        Repair counter (max 2)
 messages                list       LLM message history
+phase1_research_context str|None   Phase 1 output — persisted to session
+                                   so refine turns can reuse it without
+                                   re-running Phase 1
 ```
 
 ---
@@ -550,6 +574,8 @@ Heuristic checks on the generated code:
 - Each DS component selector in `ds_components_used` is either a known DS selector or a standard HTML tag
 - **DS usage ratio:** if fewer than 2 DS component references are found in a template with more than 5 elements → `low_ds_usage` error → triggers repair
 
+After the LangGraph workflow completes, `generate_angular_component()` computes a `DSCoverageScore` (see [Enhancement E](#enhancement-e--ds-coverage-scoring)) and includes it in the pipeline metadata returned to the API — independently of whether repair was needed.
+
 ---
 
 ### Stage 6 — Repair
@@ -563,11 +589,15 @@ should_repair() routing
 └── otherwise                 →  "repair"
         │
         ▼
-LLM receives:
+LLM receives (SystemMessage):
+  - build_ds_enforcement_system_prompt() output — selector whitelist,
+    forbidden patterns, SCSS rules (shared with refine and codegen)
+
+LLM receives (HumanMessage):
   - error list
   - first 20 component mappings
   - all current generated files
-  - DS component hints from catalog
+  - text node rules (h1–h6/p only for type="text" nodes)
 
 LLM outputs:
   - new GeneratedAngularArtifact (replaces current)
@@ -1021,7 +1051,7 @@ These hints bridge the gap between freeform Figma layer names like `"HeroActionB
 
 ## REST API Server
 
-The FastAPI server exposes the pipeline as a stateful multi-session HTTP API.
+The FastAPI server exposes the pipeline as a stateful multi-session HTTP API with DS-aware multi-turn chat.
 
 ```bash
 uvicorn api:app --reload --port 8000
@@ -1050,21 +1080,49 @@ Creates a new session for the given design system.
 ```
 
 #### `GET /sessions/{session_id}`
-Returns session state including chat history and current generated files.
+Returns session state including chat history, current generated files, and DS coverage history.
+
+```json
+{
+  "session_id": "abc-123",
+  "design_system": "primeng",
+  "has_generated_code": true,
+  "chat_history": [...],
+  "ds_coverage_history": [
+    {"total_mappable_elements": 12, "ds_mapped_elements": 10, "coverage_pct": 83.3, "uncovered_selectors": ["select"]}
+  ],
+  "current_files": [...]
+}
+```
 
 #### `DELETE /sessions/{session_id}`
 Deletes a session (204 No Content).
 
+---
+
+### Generate Endpoint — Unified Path
+
 #### `POST /sessions/{session_id}/generate`
-Runs the full Figma-to-Angular pipeline. Accepts `multipart/form-data`.
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `figma_json` | file | One of these three | Figma export JSON file |
-| `screenshot` | file | is required | Figma screenshot (PNG/JPG) |
-| `prompt` | string | | Text description of the desired component |
+Runs the full pipeline via the unified `generate_angular_component()` entry point. Accepts `multipart/form-data`. At least one input field is required.
 
-When `figma_json` is provided, runs the full 6-stage LangGraph pipeline. When only `prompt` is provided (no `figma_json`), calls `generate_from_prompt()` for a prompt-only generation.
+| Field | Type | Description |
+|---|---|---|
+| `figma_json` | file | Figma export JSON. When present, runs the full 6-stage LangGraph pipeline directly. |
+| `screenshot` | file | PNG/JPG screenshot. Used for visual styling analysis and as the synthesis input when `figma_json` is absent. |
+| `prompt` | string | Text description. When `figma_json` is absent, the pipeline synthesises a Figma-like tree from the prompt + screenshot and then runs the full pipeline. |
+
+All three fields may be combined. The routing is:
+
+```
+figma_json present?
+  YES → run pipeline with figma_json (screenshot used for styling only)
+  NO  → generate_html_from_input(prompt, screenshot)
+          → html_to_figma_tree(html, css)
+          → run pipeline with synthetic tree
+```
+
+This is handled by `generate_angular_component()` in `figma_to_angular_agent.py` — a single unified function that all three paths pass through.
 
 **Response:**
 ```json
@@ -1079,22 +1137,421 @@ When `figma_json` is provided, runs the full 6-stage LangGraph pipeline. When on
   "imports": ["import { ButtonModule } from 'primeng/button';"],
   "ds_components_used": [...],
   "unresolved_nodes": [...],
-  "chat_history": [...]
+  "unresolved_count": 2,
+  "ds_coverage": {
+    "total_mappable_elements": 12,
+    "ds_mapped_elements": 10,
+    "coverage_pct": 83.3,
+    "uncovered_selectors": ["select"]
+  },
+  "chat_history": [
+    {"role": "user", "content": "a dashboard with a dropdown"},
+    {
+      "role": "assistant",
+      "content": "I found these PrimeNG components that match your request:\n  1. <p-dropdown> — Single-value select with search...\n  2. <p-listbox> — Scrollable list...\nProceeding with <p-dropdown> (best match).",
+      "metadata": {"type": "component_suggestion"}
+    },
+    {"role": "assistant", "content": "Generated DashboardComponent"},
+    {
+      "role": "assistant",
+      "content": "Generation complete. However, 1 element(s) could not be confidently mapped to a primeng component:\n- {\"id\": \"3:12\", \"name\": \"CustomWidget\", \"reason\": \"No matching catalog entry\"}\n\nDescribe what each should be and I will re-map them.",
+      "metadata": {"type": "unresolved_notice", "unresolved_nodes": [...]}
+    }
+  ]
 }
 ```
 
+**Post-generate session updates:**
+- `s.phase1_research_context` — Phase 1 output (reused on subsequent refine turns)
+- `s.ds_coverage_history` — new coverage entry appended
+- `s.pending_unresolved` — set if unresolved nodes exist
+- Component suggestion message prepended to `chat_history` when `prompt` contains recognisable DS component terms
+
+---
+
+### Refine Endpoint — DS-Aware Multi-Turn
+
 #### `POST /sessions/{session_id}/refine`
-Refines the current generated code using a natural language prompt. Requires a prior `/generate` call.
+
+Applies a natural language change to the current generated code. Requires a prior `/generate` call. Before calling the LLM, the endpoint runs a **conversation router** that classifies the request and may return without any LLM call.
 
 ```json
 // Request
 {
-  "prompt": "Make the button full-width and add a loading state",
-  "screenshot_base64": "data:image/png;base64,..."   // optional
+  "prompt": "Add a date picker below the form",
+  "screenshot_base64": "..."   // optional — base64-encoded PNG
 }
 ```
 
-Calls `refine_with_prompt()` which sends the current files, component mappings, and the new prompt to the LLM. Returns the same shape as `/generate`.
+**Routing logic** (`route_chat_message()` in `api.py`):
+
+| Scenario | Detection | Action | LLM called? |
+|---|---|---|---|
+| Pending unresolved nodes | `session.pending_unresolved` non-empty | RESOLVE_UNRESOLVED → proceed to refine with node context | Yes |
+| Out-of-scope request | Keyword match: `NgModule`, `RouterModule`, `HttpClient`, `backend service`, `auth` | OUT_OF_SCOPE → return refusal message | No |
+| Ambiguous request | `IntentClassification.category == AMBIGUOUS` and `confidence < 0.5` | CLARIFY → return clarification question | No |
+| Normal UI change | Default | APPLY_REFINE | Yes |
+
+**OUT_OF_SCOPE response:**
+```json
+{
+  "session_id": "abc-123",
+  "action": "OUT_OF_SCOPE",
+  "message": "This tool generates Angular component UI only. Backend services, routing, NgModule configuration, and API integration are out of scope.",
+  "chat_history": [...]
+}
+```
+
+**CLARIFY response:**
+```json
+{
+  "session_id": "abc-123",
+  "action": "CLARIFY",
+  "message": "Could you clarify what you'd like to change? (layout, colors, components, or logic)",
+  "chat_history": [...]
+}
+```
+
+**APPLY_REFINE** — full DS-aware refine flow:
+
+```
+classify_refine_intent(prompt, artifact, catalog)
+        │
+        ├── DATA_LOGIC_BEHAVIOR → skip catalog lookup, patch TS only
+        ├── VISUAL_STYLE        → fetch utility class docs, patch SCSS/classes
+        ├── COMPONENT_SWAP      → catalog query + doc fetch + full refine
+        ├── LAYOUT_STRUCTURAL   → layout-focused refine
+        └── ACCESSIBILITY_PROPERTY → a11y-focused refine, no catalog query
+                │
+                ▼
+query_catalog_for_intent() — if requires_catalog_lookup
+  Scores all catalog entries against prompt terms
+  Fetches API + usage docs (respects DocScraper disk cache)
+  Returns top-3 matches with doc_text
+                │
+                ▼
+build_component_suggestion_response()
+  Adds a "found these components" message to chat_history
+                │
+                ▼
+refine_with_prompt() — LLM call
+  SystemMessage: build_ds_enforcement_system_prompt() + phase1_research_context + doc section
+  UserMessage:   current files + DS mappings + requested change
+  Returns: (new_artifact, updated_meta)
+```
+
+**Refine response** (same shape as generate):
+```json
+{
+  "session_id": "abc-123",
+  "component_name": "WelcomePageComponent",
+  "files": [...],
+  "ds_coverage": {"coverage_pct": 87.5, ...},
+  "unresolved_count": 0,
+  "chat_history": [
+    {"role": "user", "content": "Add a date picker below the form"},
+    {
+      "role": "assistant",
+      "content": "I found these PrimeNG components that match your request:\n  1. <p-calendar> — Date/time picker...\nProceeding with <p-calendar> (best match).",
+      "metadata": {"type": "component_suggestion"}
+    },
+    {"role": "assistant", "content": "Refined WelcomePageComponent"}
+  ]
+}
+```
+
+---
+
+### Session State
+
+`Session` dataclass in `session_store.py` — persisted for the lifetime of the session (60 min TTL).
+
+| Field | Type | Description |
+|---|---|---|
+| `session_id` | `str` | UUID |
+| `design_system` | `str` | Catalog name (e.g. `"primeng"`) |
+| `current_artifact` | `GeneratedAngularArtifact` | Latest generated/refined code |
+| `component_mappings` | `list` | Stage 3 DS mappings (IR node → DS selector) |
+| `chat_history` | `list` | All user + assistant messages including metadata |
+| `doc_research_cache` | `dict[url → text]` | In-session cache of fetched doc pages; avoids re-fetching on every refine |
+| `ds_coverage_history` | `list[DSCoverageScore]` | One entry per generate/refine cycle |
+| `change_log` | `list` | Intent category + selectors added/removed per refine turn |
+| `pending_suggestion` | `dict\|None` | `SuggestionState` when a low-confidence component match is awaiting confirmation |
+| `pending_unresolved` | `list` | Unresolved nodes surfaced after generate/refine; cleared when user addresses them |
+| `phase1_research_context` | `str\|None` | Phase 1 output from the most recent generate call; injected into every subsequent refine prompt |
+| `last_intent` | `dict\|None` | `IntentClassification` from the most recent refine; used to detect repeated/conflicting intents |
+
+---
+
+---
+
+## DS-Aware Generate & Refine
+
+This section documents the nine enhancements added to maximise DS component usage across both generate and refine flows. All code lives in `figma_to_angular_agent.py` and `api.py`.
+
+---
+
+### Enhancement I — Unified Generate Function
+
+**Problem:** The API previously branched between `run_figma_to_angular()` (when `figma_json` was present) and `generate_from_prompt()` (prompt/screenshot only). These two paths had inconsistent session state population and no shared DS-awareness logic.
+
+**Solution:** `generate_angular_component()` is the single entry point for all generate paths.
+
+```python
+def generate_angular_component(
+    design_system: str,
+    figma_json: Optional[Dict] = None,
+    screenshot_path: Optional[str] = None,
+    prompt: Optional[str] = None,
+    design_tokens: Optional[Dict] = None,
+    fast_mode: bool = False,
+) -> tuple[GeneratedAngularArtifact, dict]:
+    """
+    Returns (artifact, pipeline_metadata).
+    pipeline_metadata = {
+        "phase1_research_context": str,   # Phase 1 output from generate_angular_code_node
+        "ds_coverage": dict,              # DSCoverageScore.as_dict()
+    }
+    """
+```
+
+- When `figma_json` is `None`, synthesises one from `generate_html_from_input()` + `html_to_figma_tree()`.
+- Calls `run_figma_to_angular()` which now returns `(artifact, final_state)`.
+- Extracts `final_state["phase1_research_context"]` and `compute_ds_coverage()` into `pipeline_metadata`.
+- `generate_from_prompt()` is kept as a thin backward-compatible wrapper (used by `run_agent.py`).
+
+**`run_figma_to_angular()` return type change:** Now returns `(GeneratedAngularArtifact, Dict)`. `run_agent.py` and the `__main__` block use `result, _ = run_figma_to_angular(...)`.
+
+---
+
+### Enhancement G — Shared DS Enforcement Prompt
+
+**Problem:** Enforcement rules were duplicated across the code-gen system prompt, the repair prompt, and the refine prompt — with inconsistencies between them.
+
+**Solution:** `build_ds_enforcement_system_prompt(catalog, design_system, intent_category=None)` builds a single canonical enforcement block used in all three contexts.
+
+```
+## DESIGN SYSTEM ENFORCEMENT RULES (Mandatory)
+
+### Allowed component selectors (exhaustive list):
+  - p-button
+  - p-dropdown
+  - ...
+
+### Custom element tag whitelist:
+  <p-button>  <p-dropdown>  <p-calendar>  ...
+
+### FORBIDDEN patterns:
+- NEVER emit a custom element tag not in the whitelist above
+- NEVER use style="..." inline attributes for typography or layout
+- NEVER use native <select>, <input type="date">, <button> where a DS equivalent exists
+
+### SCSS rules:
+- Write ONLY layout-level properties: flex, grid, padding, gap, margin, background-color, border, box-shadow
+- Typography → use utility classes or leave to DS default styles
+- Pixel overrides ONLY when no DS utility class exists
+
+### Intent-specific rule:   ← only present when intent_category is supplied
+(e.g. DATA_LOGIC_BEHAVIOR: Only modify TypeScript logic. Do NOT touch the HTML template or SCSS.)
+```
+
+**Usage:**
+- `repair_node()`: injected as `SystemMessage` before the repair `HumanMessage`.
+- `refine_with_prompt()`: prepended to the refine system prompt.
+- (The code-gen system prompt in `generate_angular_code_node` already contains equivalent rules; `build_ds_enforcement_system_prompt` serves as the shared canonical version for repair and refine.)
+
+---
+
+### Enhancement A — Intent Classification
+
+**Problem:** The refine LLM was called unconditionally for every request, including logic-only changes that don't need catalog lookup.
+
+**Solution:** `classify_refine_intent(prompt, current_artifact, catalog)` runs before every refine call.
+
+```python
+@dataclass
+class IntentClassification:
+    category: str               # One of the six values below
+    new_components_requested: List[str]   # Component terms from the prompt
+    affected_selectors: List[str]         # DS selectors already in the artifact
+    requires_catalog_lookup: bool
+    requires_doc_research: bool
+    confidence: float
+```
+
+**Six categories:**
+
+| Category | Catalog lookup? | Doc research? | Example prompt |
+|---|---|---|---|
+| `LAYOUT_STRUCTURAL` | Yes | No | "center the header", "add a sidebar" |
+| `VISUAL_STYLE` | Yes (utility classes) | Yes (utility docs) | "change the button color to blue" |
+| `COMPONENT_SWAP` | Yes | Yes | "replace the input with a dropdown" |
+| `DATA_LOGIC_BEHAVIOR` | No | No | "add a click handler", "filter the list" |
+| `ACCESSIBILITY_PROPERTY` | No | No | "add aria-label to the button" |
+| `AMBIGUOUS` | Yes | Yes | "make it look better" |
+
+**Classification flow:**
+1. Five compiled regex patterns are tested in priority order — if one matches, return immediately at `confidence=0.8`.
+2. If no regex matches, make a single cheap LLM call (temperature=0, no structured output) to classify.
+3. On LLM failure, default to `AMBIGUOUS` with `requires_catalog_lookup=True`.
+
+---
+
+### Enhancement B — Catalog Lookup & Doc Research in Refine
+
+**Problem:** Phase 1 doc research ran only during generation. Refine calls had no API knowledge for new components requested by the user.
+
+**Solution:** `query_catalog_for_intent(prompt, catalog, new_component_terms, doc_research_cache)` is called inside `refine_with_prompt()` when `intent.requires_catalog_lookup` is true.
+
+```python
+def query_catalog_for_intent(
+    prompt: str,
+    catalog: Dict,
+    new_component_terms: List[str],
+    doc_research_cache: Optional[Dict[str, str]] = None,
+) -> tuple[List[Dict], Dict[str, str]]:
+    """
+    Returns (top_matches, updated_doc_cache).
+    Each match: {selector, name, description, score, doc_text}.
+    doc_text is fetched from entry.urls["api"] and entry.urls["usage"]
+    via DocScraper (disk-cached under design_systems/cache/).
+    """
+```
+
+**Scoring:** uses the same hint-matching logic as Stage 3 — `+60` for word-boundary match in prompt, `+40` for substring, `+30` for match in `new_component_terms`. Returns top 3 entries with score ≥ 30.
+
+**Doc fetching:** checks `doc_research_cache` (in-session, from `Session.doc_research_cache`) before calling `DocScraper.fetch()`. This means a component's docs are fetched at most once per session.
+
+The fetched doc text is injected into the refine system prompt under `## RELEVANT COMPONENT DOCUMENTATION` with up to 2,000 chars per component.
+
+---
+
+### Enhancement C — Proactive Component Suggestions
+
+**Problem:** When a user typed "add a dropdown", the agent silently generated code with no transparency about which DS component was chosen.
+
+**Solution:** `build_component_suggestion_response(catalog, top_matches)` builds a human-readable message that is prepended to `chat_history` before the refine/generate result.
+
+```
+I found these PrimeNG components that match your request:
+  1. <p-dropdown> — Single-value select with search, filtering, and templating support
+  2. <p-listbox>  — Scrollable list with single/multi selection
+  3. <p-select>   — Compact single-value selector
+
+Proceeding with <p-dropdown> (best match).
+```
+
+**Confidence gate:**
+- Top match score ≥ 70, or only one match → proceed automatically, suggestion appended to chat (non-blocking).
+- Top match score 30–70 with multiple close matches → suggestion appended with "Reply to choose a different option." Sets `session.pending_suggestion`. The next user message is treated as confirmation (current implementation always proceeds; confirmation blocking can be added).
+
+Applies to **both** generate (when `prompt` is provided) and refine (always, when catalog lookup is triggered).
+
+---
+
+### Enhancement D — Unresolved Node Follow-up
+
+**Problem:** `artifact.unresolved_nodes` was populated and saved to `metadata.json` but never surfaced in the chat interface.
+
+**Solution:** After every generate and refine call, if `artifact.unresolved_nodes` is non-empty:
+
+1. A structured assistant message is appended to `chat_history`:
+   ```json
+   {
+     "role": "assistant",
+     "content": "Generation complete. However, 2 element(s) could not be confidently mapped to a primeng component:\n- {\"id\": \"3:12\", \"name\": \"CustomWidget\", ...}\n\nDescribe what each should be and I will re-map them.",
+     "metadata": {
+       "type": "unresolved_notice",
+       "unresolved_nodes": [...]
+     }
+   }
+   ```
+2. `session.pending_unresolved` is set to the list of unresolved nodes.
+3. `route_chat_message()` returns `RESOLVE_UNRESOLVED` on the next refine call, so the refine prompt targets those nodes specifically.
+4. After refine, `pending_unresolved` is reset to `[]` (or repopulated if new unresolved nodes appear).
+
+Both `/generate` and `/refine` responses include `"unresolved_count"` in their JSON.
+
+---
+
+### Enhancement E — DS Coverage Scoring
+
+**Problem:** Validation used a binary `low_ds_usage` flag (`ds_count < 2`). There was no percentage metric and no per-turn tracking.
+
+**Solution:** `compute_ds_coverage(artifact, design_system, catalog)` parses generated HTML using stdlib `html.parser` and returns a `DSCoverageScore`.
+
+```python
+@dataclass
+class DSCoverageScore:
+    total_mappable_elements: int   # Tags matching DS selectors OR mappable native tags
+    ds_mapped_elements: int        # Tags matching a catalog selector
+    coverage_pct: float            # ds_mapped / total * 100
+    uncovered_selectors: List[str] # Native tags used where a DS component could replace them
+```
+
+**"Mappable" definition:** any tag that is either a DS catalog selector, or one of `button`, `select`, `input`, `textarea`, `table`, `a`.
+
+**When computed:**
+- After `generate_angular_component()` — included in `pipeline_metadata["ds_coverage"]`.
+- After `refine_with_prompt()` — included in `updated_meta["ds_coverage"]`.
+- Both endpoints include `"ds_coverage"` in their JSON response.
+- Each value is appended to `session.ds_coverage_history` (one entry per turn).
+
+**Coverage visible in `GET /sessions/{id}`** via `ds_coverage_history`.
+
+---
+
+### Enhancement F — Session State Enrichment
+
+Seven new fields added to the `Session` dataclass in `session_store.py`:
+
+| Field | Type | Populated by | Purpose |
+|---|---|---|---|
+| `doc_research_cache` | `dict[url→text]` | `refine_with_prompt()` | Avoids re-fetching component docs every refine turn |
+| `ds_coverage_history` | `list[dict]` | Generate + refine endpoints | Per-turn DS coverage metric |
+| `change_log` | `list[dict]` | (reserved for future diff tracking) | Intent + selectors added/removed per turn |
+| `pending_suggestion` | `dict\|None` | Generate + refine endpoints | Low-confidence component match awaiting confirmation |
+| `pending_unresolved` | `list[dict]` | Generate + refine endpoints | Unresolved nodes awaiting user clarification |
+| `phase1_research_context` | `str\|None` | Generate endpoint | Phase 1 output reused in all subsequent refine prompts |
+| `last_intent` | `dict\|None` | Refine endpoint | Last `IntentClassification` for detecting repeated intents |
+
+`phase1_research_context` is the key continuity bridge: the documentation gathered during generation (utility classes, component APIs) is reused verbatim in refine prompts under `## GENERATION-TIME RESEARCH CONTEXT`, eliminating the need to re-run Phase 1 on every refinement.
+
+---
+
+### Enhancement H — Multi-Turn Conversation Routing
+
+**Problem:** Every refine prompt was forwarded directly to the LLM regardless of whether it was meaningful, out of scope, or ambiguous.
+
+**Solution:** `route_chat_message(prompt, session, catalog)` runs before every refine LLM call.
+
+```python
+@dataclass
+class ChatRouteDecision:
+    action: str                           # APPLY_REFINE | CLARIFY | OUT_OF_SCOPE | RESOLVE_UNRESOLVED
+    clarification_question: Optional[str]
+    refusal_reason: Optional[str]
+    intent: Optional[dict]                # IntentClassification.as_dict()
+```
+
+**Out-of-scope detection** (regex, no LLM):
+```python
+_OUT_OF_SCOPE_PATTERN = re.compile(
+    r"\b(NgModule|app\.module|RouterModule|routing|HttpClient|backend service|
+         connect to api|rest endpoint|database|auth(?:entication|orization)?)\b",
+    re.IGNORECASE,
+)
+```
+Matched → `OUT_OF_SCOPE` response returned immediately, no LLM called, no code changed.
+
+**Ambiguity detection** (uses `classify_refine_intent`):
+- `category == AMBIGUOUS` and `confidence < 0.5` → `CLARIFY` response.
+
+**Normal flow:**
+- `intent` is passed to `refine_with_prompt()` so `classify_refine_intent` is not called twice.
+- `intent.as_dict()` is stored in `session.last_intent`.
+
+**Graceful degradation:** If `classify_refine_intent` throws, the router falls back to `APPLY_REFINE` — the refine call always proceeds on any unexpected failure.
 
 ---
 
@@ -1125,6 +1582,33 @@ class ValidationError(BaseModel):
     message:    str
     line:       Optional[int]
     suggestion: Optional[str]
+
+# ── DS-Aware Enhancement models ──────────────────────────────────────────────
+
+@dataclass
+class DSCoverageScore:
+    total_mappable_elements: int   # DS + native interactive tags found in HTML
+    ds_mapped_elements:      int   # tags matching a catalog selector
+    coverage_pct:            float # ds_mapped / total * 100
+    uncovered_selectors:     List[str]  # native tags where DS equivalent exists
+    # .as_dict() → serialisable dict included in every API response
+
+@dataclass
+class IntentClassification:
+    category:                 str    # LAYOUT_STRUCTURAL | VISUAL_STYLE | COMPONENT_SWAP |
+                                     # DATA_LOGIC_BEHAVIOR | ACCESSIBILITY_PROPERTY | AMBIGUOUS
+    new_components_requested: List[str]   # component terms extracted from prompt
+    affected_selectors:       List[str]   # DS selectors already in current artifact
+    requires_catalog_lookup:  bool
+    requires_doc_research:    bool
+    confidence:               float  # 0.0–1.0
+
+@dataclass
+class ChatRouteDecision:
+    action:                   str    # APPLY_REFINE | CLARIFY | OUT_OF_SCOPE | RESOLVE_UNRESOLVED
+    clarification_question:   Optional[str]
+    refusal_reason:           Optional[str]
+    intent:                   Optional[dict]  # IntentClassification.as_dict()
 ```
 
 ---
@@ -1193,8 +1677,12 @@ Cache entries are permanent until manually deleted. Delete `*.txt` files in `cac
 
 ## LLM Calls Summary
 
+### Generation pipeline
+
 | Step | Model | Structured? | When |
 |---|---|---|---|
+| Prompt→HTML synthesis | gpt-4o | No (JSON parsed) | When `figma_json` absent (prompt/screenshot path) |
+| HTML→Figma tree synthesis | gpt-4o | No (JSON parsed) | When `figma_json` absent (prompt/screenshot path) |
 | IR generation | gpt-4o | No (JSON parsed manually) | Always |
 | Ambiguous node resolution (batch) | gpt-4o | No | If ambiguous nodes exist (30 ≤ score < 70) |
 | Low-confidence node resolution (per-node) | gpt-4o | No | If score 1–29 nodes exist |
@@ -1202,11 +1690,26 @@ Cache entries are permanent until manually deleted. Delete `*.txt` files in `cac
 | Screenshot analysis | gpt-4o vision | No | If screenshot provided |
 | Code generation | gpt-4o | Yes (Pydantic) | Always |
 | Repair | gpt-4o | Yes (Pydantic) | If validation fails, max 2× |
-| `generate_figma_hints.py` | gpt-4o | No | One-time setup |
-| `doc_knowledge_builder.py` — class extraction | gpt-4o | No | One-time setup |
+
+### Refine pipeline (DS-aware)
+
+| Step | Model | Structured? | When |
+|---|---|---|---|
+| Intent classification | gpt-4o | No (JSON parsed) | Only when all five regex patterns fail to match |
+| Catalog doc fetch | — (DocScraper) | — | When `requires_catalog_lookup=True` and component terms found |
+| Refine code generation | gpt-4o | Yes (Pydantic) | When router returns APPLY_REFINE |
+
+### One-time setup scripts
+
+| Step | Model | Structured? | When |
+|---|---|---|---|
+| `generate_figma_hints.py` | gpt-4o | No | One-time per DS |
+| `doc_knowledge_builder.py` — class extraction | gpt-4o | No | One-time per DS |
 | `doc_knowledge_builder.py` — `--enrich-catalog` | gpt-4o | No | One-time per catalog update |
 
-**Typical cost per run (no repair, warm cache):** 2 LLM calls (IR + code generation) + Phase 1 tool iterations (fast after first run — cache hits).
+**Typical generate cost (no repair, warm cache):** 2–3 LLM calls (IR + Phase 1 tool loop + code generation).
+
+**Typical refine cost (warm doc cache, heuristic intent match):** 1 LLM call (refine code generation). Intent regex matches avoid the classification LLM call. Catalog docs are served from `session.doc_research_cache` or `design_systems/cache/` — no new fetches after the first refine for a given component.
 
 ---
 
@@ -1241,6 +1744,21 @@ Every optional feature (screenshot, knowledge base, component docs, design token
 
 ### 10. Chunked IR generation for large designs
 Figma exports from complex screens can exceed 100 KB. The pipeline detects this, flattens the tree, processes 50-node chunks in parallel LLM calls, then reconstructs the hierarchy — enabling designs with hundreds of nodes to be processed without hitting context limits.
+
+### 11. Unified generate entry point
+`generate_angular_component()` accepts any combination of `figma_json`, `screenshot_path`, and `prompt`. When `figma_json` is absent it synthesises a Figma-like tree. All three paths pass through the same pipeline, guaranteeing identical DS-awareness regardless of input type.
+
+### 12. Shared enforcement across generate, refine, and repair
+`build_ds_enforcement_system_prompt()` produces a single canonical DS enforcement block (selector whitelist, forbidden patterns, SCSS rules, intent-specific override). Injecting the same text into the code-gen, refine, and repair contexts prevents inconsistency — a tag forbidden during generation is equally forbidden during repair.
+
+### 13. Intent-gated catalog lookup in refine
+Classifying the intent of each refine request before querying the catalog prevents unnecessary doc fetches for DATA_LOGIC_BEHAVIOR changes (TypeScript-only) and ACCESSIBILITY_PROPERTY changes (attribute additions). Catalog lookup is reserved for changes that actually touch the component tree.
+
+### 14. Phase 1 context reuse across turns
+Phase 1 output (utility classes, component APIs) is stored in the session as `phase1_research_context` after generation. Every subsequent refine prompt injects this context under `## GENERATION-TIME RESEARCH CONTEXT` — so the LLM retains DS knowledge accumulated during generation without re-running Phase 1.
+
+### 15. Conversation routing before LLM invocation
+`route_chat_message()` in `api.py` performs out-of-scope detection (regex, zero LLM cost) and ambiguity detection (intent classification) before the refine LLM is called. Out-of-scope requests (routing, NgModule, backend services) are deflected with a plain text response; ambiguous requests receive a clarification question. The LLM is only invoked for requests that are clearly actionable UI changes.
 
 ---
 
