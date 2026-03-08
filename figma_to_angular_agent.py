@@ -848,6 +848,7 @@ class AgentState(TypedDict):
     messages: List[Any]
     ds_knowledge: Optional[Dict[str, Any]]   # pre-built utility class knowledge
     phase1_research_context: Optional[str]   # Phase 1 doc research output
+    user_prompt: Optional[str]               # Optional user instruction carried through the full pipeline
 
 
 # ============================================================================
@@ -2425,6 +2426,7 @@ def generate_angular_code_node(state: AgentState) -> AgentState:
         if clean_name and clean_name != "Document":
             root_name = clean_name + "Component"
 
+    user_prompt = state.get("user_prompt") or ""
     design_structure = _build_design_structure_for_codegen(figma_json, ir_tree, mappings)
 
     # Screenshot analysis (optional)
@@ -2452,6 +2454,18 @@ def generate_angular_code_node(state: AgentState) -> AgentState:
         if c.get("selector") and c["selector"].lower() not in _NATIVE_HTML_TAGS
     ]
     allowed_tags_str = "  ".join(f"<{s}>" for s in _custom_selectors) if _custom_selectors else "(none)"
+
+    # Build user instruction section (prompt always injected, regardless of input path)
+    user_instructions_section = ""
+    if user_prompt:
+        user_instructions_section = f"""
+## USER INSTRUCTIONS (HIGHEST PRIORITY — FOLLOW EXACTLY)
+The user provided the following instructions for this generation. These take precedence over
+all default heuristics. Treat any component or style preferences stated here as mandatory:
+
+{user_prompt}
+
+"""
 
     # Build research context section for the prompt (Phase 1 output)
     utility_classes_section = ""
@@ -2509,6 +2523,7 @@ CRITICAL TEXT RULES:
 
 {code_gen_mappings_section}
 {utility_classes_section}
+{user_instructions_section}
 GENERATE:
 
 1. TypeScript Component (standalone):
@@ -3226,6 +3241,7 @@ def generate_angular_component(
         figma_screenshots=figma_screenshots,
         design_system=design_system,
         fast_mode=fast_mode,
+        user_prompt=prompt,
     )
 
     catalog = load_ds_catalog(design_system)
@@ -3677,6 +3693,7 @@ def run_figma_to_angular(
     figma_screenshots: Optional[Dict[str, str]] = None,
     design_system: str = "",
     fast_mode: bool = False,
+    user_prompt: Optional[str] = None,
 ) -> "tuple[GeneratedAngularArtifact, Dict]":
     """Run the Figma → Angular pipeline.
 
@@ -3766,6 +3783,7 @@ def run_figma_to_angular(
         "messages": [],
         "ds_knowledge": knowledge,
         "phase1_research_context": None,
+        "user_prompt": user_prompt or None,
     }
 
     print("Invoking workflow...")
