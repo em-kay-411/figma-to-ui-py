@@ -313,6 +313,7 @@ def _score_catalog_match(
     figma_node_name: str,
     entry: Dict,
     figma_orig_node: Optional[Dict] = None,
+    prompt_hints: Optional[List[str]] = None,
 ) -> int:
     """Return a 0–100 score for how well a catalog entry matches this IR node.
 
@@ -323,6 +324,7 @@ def _score_catalog_match(
       +15  Figma node type (INSTANCE/FRAME/…) in entry's figma_node_types
       + 5  node is a Figma INSTANCE (likely a real component)
       +15  any child node's name contains a catalog hint  (structural context)
+      +50  entry selector/name matches a user prompt hint (user explicitly requested it)
     """
     score = 0
     ir_type = ir_node.get("type", "")
@@ -372,10 +374,26 @@ def _score_catalog_match(
                 score += 15
                 break
 
+    # ── Prompt instruction boost ───────────────────────────────────────────
+    # If the user explicitly requested this component/selector, strongly prefer it.
+    if prompt_hints:
+        entry_name = entry.get("name", "").lower()
+        entry_sel = entry.get("selector", "").lower()
+        for ph in prompt_hints:
+            ph_lower = ph.lower().strip("<>")
+            if ph_lower and (ph_lower == entry_name or ph_lower == entry_sel
+                             or ph_lower in entry_name or ph_lower in entry_sel):
+                score += 50
+                break
+
     return min(score, 100)
 
 
-def _resolve_ambiguous_with_llm(ambiguous_nodes: List[Dict], catalog_entries: List[Dict]) -> List[Dict]:
+def _resolve_ambiguous_with_llm(
+    ambiguous_nodes: List[Dict],
+    catalog_entries: List[Dict],
+    prompt_hints: Optional[List[str]] = None,
+) -> List[Dict]:
     """Single batch LLM call to resolve ambiguous node → component mappings.
 
     Returns a list of mapping dicts (same shape as definite_mappings entries).
@@ -424,11 +442,20 @@ def _resolve_ambiguous_with_llm(ambiguous_nodes: List[Dict], catalog_entries: Li
         for item in ambiguous_nodes
     ]
 
+    user_preference_block = ""
+    if prompt_hints:
+        user_preference_block = (
+            f"\n\nUSER PREFERENCE (MANDATORY): The user explicitly requested these components. "
+            f"Map nodes to them when they are a reasonable fit — prefer them over other candidates:\n"
+            + "\n".join(f"  - {h}" for h in prompt_hints)
+            + "\n"
+        )
+
     prompt = f"""You are mapping Figma design nodes to design system components.
 
 Available components:
 {json.dumps(catalog_summary, indent=2)}
-
+{user_preference_block}
 For each node below, choose the best matching component selector, or use a plain
 HTML tag ("div", "section", "ul", etc.) if nothing fits.
 
@@ -479,6 +506,7 @@ Output ONLY valid JSON array, no markdown fences or explanation."""
 def _resolve_uncertain_nodes_parallel(
     uncertain_nodes: List[Dict],
     catalog_entries: List[Dict],
+    prompt_hints: Optional[List[str]] = None,
 ) -> List[Dict]:
     """Resolve Tier 2 + Tier 3 nodes via parallel batched LLM calls.
 
@@ -500,7 +528,7 @@ def _resolve_uncertain_nodes_parallel(
 
     def process_batch(idx: int, batch: List[Dict]) -> tuple:
         try:
-            return idx, _resolve_ambiguous_with_llm(batch, catalog_entries)
+            return idx, _resolve_ambiguous_with_llm(batch, catalog_entries, prompt_hints)
         except Exception as exc:
             print(f"  Warning: sub-batch {idx+1} failed ({exc}), using native fallback")
             return idx, [
@@ -849,6 +877,8 @@ class AgentState(TypedDict):
     ds_knowledge: Optional[Dict[str, Any]]   # pre-built utility class knowledge
     phase1_research_context: Optional[str]   # Phase 1 doc research output
     user_prompt: Optional[str]               # Optional user instruction carried through the full pipeline
+    prompt_research_context: Optional[str]   # Rich research output from resolve_prompt_instructions node
+    prompt_component_hints: Optional[List[str]]  # Catalog selectors/names explicitly requested by user
 
 
 # ============================================================================
@@ -877,6 +907,208 @@ def load_ds_knowledge(design_system: str) -> Optional[Dict]:
         return data
     print(f"No knowledge file: {path} (utility class lookup disabled)")
     return None
+
+
+# ============================================================================
+# PROMPT INSTRUCTION TOOLS (used by resolve_prompt_instructions_node)
+# ============================================================================
+
+@lc_tool
+def catalog_lookup(component_name: str) -> str:
+    """Look up a design system component by name or selector.
+
+    Returns the component's selector, description, inputs, figma_hints, and
+    available documentation URLs so the LLM can decide whether to use it.
+    """
+    if not DS_CATALOG_ENTRY_MAP:
+        return "Catalog not loaded yet."
+    query = component_name.lower().strip()
+    entry = DS_CATALOG_ENTRY_MAP.get(query)
+    if not entry:
+        # Partial match
+        for key, val in DS_CATALOG_ENTRY_MAP.items():
+            if query in key or key in query:
+                entry = val
+                break
+    if not entry:
+        names = list({v.get("name", "") for v in DS_CATALOG_ENTRY_MAP.values()})[:20]
+        return f"No component found for '{component_name}'. Available: {', '.join(names)}"
+    result = {
+        "name": entry.get("name"),
+        "selector": entry.get("selector"),
+        "description": entry.get("description", ""),
+        "figma_hints": entry.get("figma_hints", []),
+        "base_classes": entry.get("base_classes", []),
+        "variant_class_map": entry.get("variant_class_map", {}),
+        "inner_html_note": entry.get("inner_html_note", ""),
+        "urls": entry.get("urls", {}),
+    }
+    return json.dumps(result, indent=2)
+
+
+@lc_tool
+def component_docs_lookup(selector: str) -> str:
+    """Fetch API and usage documentation for a design system component.
+
+    Pass the component selector (e.g. 'p-dropdown') or name. Returns scraped
+    documentation text covering inputs, outputs, and usage examples.
+    Returns a summary of up to 3000 characters.
+    """
+    if not DS_CATALOG_ENTRY_MAP:
+        return "Catalog not loaded."
+    query = selector.lower().strip()
+    entry = DS_CATALOG_ENTRY_MAP.get(query)
+    if not entry:
+        for key, val in DS_CATALOG_ENTRY_MAP.items():
+            if query in key or key in query:
+                entry = val
+                break
+    if not entry:
+        return f"No catalog entry found for selector '{selector}'."
+    scraper = DocScraper()
+    docs_parts = []
+    for url_key in ("api", "usage", "overview"):
+        url = entry.get("urls", {}).get(url_key, "")
+        if url:
+            try:
+                text = scraper.fetch(url)
+                if text:
+                    docs_parts.append(f"### {url_key.upper()} ({url})\n{text[:1500]}")
+            except Exception:
+                pass
+    if not docs_parts:
+        return f"No documentation available for '{selector}'."
+    return "\n\n".join(docs_parts)[:3000]
+
+
+@lc_tool
+def utility_class_lookup(concept: str) -> str:
+    """Search the design system knowledge base for utility classes matching a concept.
+
+    Pass a CSS concept or style property (e.g. 'spacing', 'flex', 'color',
+    'typography', 'border'). Returns matching utility class names and descriptions.
+    """
+    if not DOC_KNOWLEDGE:
+        return "No utility class knowledge loaded for this design system."
+    query = concept.lower().strip()
+    results = []
+    for sec_name, sec_data in DOC_KNOWLEDGE.get("sections", {}).items():
+        if query in sec_name.lower():
+            # Whole section matches — return all classes in it
+            for entry_key, entry_data in sec_data.items():
+                for cls, desc in list(entry_data.get("classes", {}).items())[:20]:
+                    results.append(f".{cls} — {desc}  [{sec_name}]")
+        else:
+            for entry_key, entry_data in sec_data.items():
+                if query in entry_key.lower():
+                    for cls, desc in list(entry_data.get("classes", {}).items())[:20]:
+                        results.append(f".{cls} — {desc}  [{sec_name}/{entry_key}]")
+                else:
+                    for cls, desc in entry_data.get("classes", {}).items():
+                        if query in cls.lower() or query in desc.lower():
+                            results.append(f".{cls} — {desc}  [{sec_name}/{entry_key}]")
+    if not results:
+        sections = list(DOC_KNOWLEDGE.get("sections", {}).keys())
+        return f"No utility classes found for '{concept}'. Available sections: {', '.join(sections)}"
+    return "\n".join(results[:40])
+
+
+_PROMPT_INSTRUCTION_TOOLS = [catalog_lookup, component_docs_lookup, utility_class_lookup]
+
+
+def resolve_prompt_instructions_node(state: AgentState) -> AgentState:
+    """Pre-IR node: research catalog + docs for any DS components / utility classes
+    mentioned in the user prompt.
+
+    Uses an LLM with catalog_lookup, component_docs_lookup, and utility_class_lookup
+    tools bound. Runs a tool-calling loop (max 6 rounds) to gather information, then
+    stores the result in state as:
+      - prompt_research_context: rich text injected into IR and codegen prompts
+      - prompt_component_hints:  list of catalog selectors the user explicitly wants
+    Returns state unchanged (without setting these fields) when no user_prompt is set.
+    """
+    user_prompt = state.get("user_prompt") or ""
+    if not user_prompt.strip():
+        state["prompt_research_context"] = None
+        state["prompt_component_hints"] = []
+        return state
+
+    METRICS.start_step("resolve_prompt_instructions")
+    ds_config = state.get("ds_config") or {}
+    ds_name = ds_config.get("name", "the design system")
+    catalog_entries = state.get("ds_catalog_entries") or []
+    selector_list = [e.get("selector", "") for e in catalog_entries if e.get("selector")]
+
+    system = f"""You are a {ds_name} design system expert helping to plan an Angular component generation.
+
+The user has provided instructions that may reference specific UI components, layout patterns,
+or style utilities. Your job is to:
+1. Identify every UI element or component the user wants to use
+2. Look up the exact catalog component for each using `catalog_lookup`
+3. Fetch relevant API docs for those components using `component_docs_lookup`
+4. Look up any utility classes mentioned using `utility_class_lookup`
+
+Available catalog selectors: {', '.join(selector_list[:30]) if selector_list else '(none loaded)'}
+
+After researching, write a concise structured summary formatted as:
+## PROMPT INSTRUCTION RESOLUTION
+### Components to use:
+- <selector>: <when/where to use it> — key inputs: <list key inputs>
+### Utility classes:
+- .<class>: <what it does>
+### Node mapping hints:
+- <node name pattern or section>: use <selector>
+
+Be specific. Only list components you confirmed exist in the catalog via tool calls."""
+
+    llm = ChatOpenAI(model=Config.LLM_MODEL, temperature=0.0, api_key=Config.OPENAI_API_KEY)
+    llm_with_tools = llm.bind_tools(_PROMPT_INSTRUCTION_TOOLS)
+
+    messages: List[Any] = [
+        SystemMessage(content=system),
+        HumanMessage(content=f"User instructions:\n{user_prompt}"),
+    ]
+
+    max_rounds = 6
+    for _ in range(max_rounds):
+        response = llm_with_tools.invoke(messages)
+        messages.append(response)
+        tool_calls = getattr(response, "tool_calls", []) or []
+        if not tool_calls:
+            break
+        for tc in tool_calls:
+            tool_name = tc["name"]
+            tool_args = tc["args"]
+            tool_fn_map = {t.name: t for t in _PROMPT_INSTRUCTION_TOOLS}
+            fn = tool_fn_map.get(tool_name)
+            if fn:
+                try:
+                    result = fn.invoke(tool_args)
+                except Exception as exc:
+                    result = f"Tool error: {exc}"
+            else:
+                result = f"Unknown tool: {tool_name}"
+            messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+
+    research_text = getattr(messages[-1], "content", "") if messages else ""
+    METRICS.record_llm_call(len(user_prompt), len(research_text), "resolve_prompt_instructions")
+
+    # Extract selectors mentioned in the research output for score boosting
+    hints: List[str] = []
+    for entry in catalog_entries:
+        sel = entry.get("selector", "")
+        name = entry.get("name", "")
+        if sel and sel in research_text:
+            hints.append(sel)
+        elif name and name.lower() in research_text.lower():
+            hints.append(sel or name)
+    hints = list(dict.fromkeys(hints))  # deduplicate, preserve order
+
+    state["prompt_research_context"] = research_text
+    state["prompt_component_hints"] = hints
+    print(f"Prompt research complete. Hints: {hints}")
+    METRICS.end_step("resolve_prompt_instructions")
+    return state
 
 
 # ============================================================================
@@ -1229,8 +1461,21 @@ def build_ir_node(state: AgentState) -> AgentState:
 
 def _process_single_tree(llm, compact_tree: Dict, state: AgentState) -> List[Dict]:
     """Process entire Figma tree in a single LLM call."""
-    system_prompt = """You are an expert at analyzing Figma design trees and converting them to semantic UI components.
+    prompt_research_context = state.get("prompt_research_context") or ""
+    prompt_instruction_section = ""
+    if prompt_research_context:
+        prompt_instruction_section = f"""
+## USER INSTRUCTION CONTEXT
+The user provided instructions that were researched before IR generation.
+Use the component preferences below when assigning 'type' to nodes:
 
+{prompt_research_context[:2000]}
+
+When classifying nodes, prefer the semantic types that align with the components listed above.
+"""
+
+    system_prompt = f"""You are an expert at analyzing Figma design trees and converting them to semantic UI components.
+{prompt_instruction_section}
 Convert this Figma tree to semantic UI primitives (IR - Intermediate Representation).
 
 For EACH node in the tree (including all nested children), identify:
@@ -1246,27 +1491,27 @@ CRITICAL: You must process the ENTIRE tree structure. Do not skip any nodes.
 
 Output as a JSON array with the root node(s). Example structure:
 [
-  {
+  {{
     "id": "1:2",
     "type": "container",
     "name": "MainContainer",
     "layout": "flex-column",
-    "properties": {},
-    "constraints": {},
-    "styling": {"backgroundColor": "#fff"},
+    "properties": {{}},
+    "constraints": {{}},
+    "styling": {{"backgroundColor": "#fff"}},
     "children": [
-      {
+      {{
         "id": "1:3",
         "type": "text",
         "name": "Title",
         "layout": "flex-row",
-        "properties": {"text": "Welcome"},
+        "properties": {{"text": "Welcome"}},
         "children": [],
-        "constraints": {},
-        "styling": {"color": "#000", "fontSize": 24}
-      }
+        "constraints": {{}},
+        "styling": {{"color": "#000", "fontSize": 24}}
+      }}
     ]
-  }
+  }}
 ]
 
 IMPORTANT:
@@ -1351,8 +1596,20 @@ def _process_chunked_tree(llm, flat_nodes: List[Dict], original_tree: Dict, stat
     """Process large Figma tree in parallel chunks and reconstruct the hierarchy."""
     chunks = _chunk_nodes(flat_nodes, Config.MAX_NODES_PER_CHUNK)
 
-    system_prompt = """You are an expert at analyzing Figma design nodes and converting them to semantic UI components.
+    prompt_research_context = state.get("prompt_research_context") or ""
+    prompt_instruction_section = ""
+    if prompt_research_context:
+        prompt_instruction_section = f"""
+## USER INSTRUCTION CONTEXT
+The user provided instructions that were researched before IR generation.
+Use these component preferences when assigning 'type' to nodes:
 
+{prompt_research_context[:2000]}
+
+"""
+
+    system_prompt = f"""You are an expert at analyzing Figma design nodes and converting them to semantic UI components.
+{prompt_instruction_section}
 Convert these Figma nodes to semantic UI primitives (IR - Intermediate Representation).
 
 For EACH node, identify:
@@ -1368,16 +1625,16 @@ Note: These are flattened nodes from a larger tree. Each node has:
 
 Output as a JSON array with ONE entry per input node. Each entry MUST use this exact structure:
 [
-  {
+  {{
     "id": "1:2",
     "type": "container",
     "name": "MainContainer",
     "layout": "flex-column",
-    "properties": {},
-    "constraints": {},
-    "styling": {"backgroundColor": "#fff"},
+    "properties": {{}},
+    "constraints": {{}},
+    "styling": {{"backgroundColor": "#fff"}},
     "children": []
-  }
+  }}
 ]
 
 IMPORTANT:
@@ -1385,7 +1642,7 @@ IMPORTANT:
 - Include ALL input nodes in output — never skip any
 - "layout" must be a string (flex-row, flex-column, grid, absolute, stack), never a dict
 - "children" is always an empty array [] — hierarchy is reconstructed separately
-- "properties" must include "text" for TEXT nodes (e.g. {"text": "Hello"})"""
+- "properties" must include "text" for TEXT nodes (e.g. {{"text": "Hello"}})"""
 
     max_workers = min(8, len(chunks))
     print(f"Split into {len(chunks)} chunk(s), {max_workers} parallel worker(s)")
@@ -1478,6 +1735,7 @@ def map_to_design_system_node(state: AgentState) -> AgentState:
         return state
 
     catalog_entries: List[Dict] = state.get("ds_catalog_entries") or []
+    prompt_hints: List[str] = state.get("prompt_component_hints") or []
     figma_lookup = _build_figma_node_lookup(state.get("figma_json") or {})
     scraper = DocScraper()
 
@@ -1525,7 +1783,7 @@ def map_to_design_system_node(state: AgentState) -> AgentState:
             [
                 (s, entry)
                 for entry in catalog_entries
-                if (s := _score_catalog_match(ir_node, node_name, entry, figma_orig_node)) > 0
+                if (s := _score_catalog_match(ir_node, node_name, entry, figma_orig_node, prompt_hints)) > 0
             ],
             key=lambda x: x[0],
             reverse=True,
@@ -1575,7 +1833,7 @@ def map_to_design_system_node(state: AgentState) -> AgentState:
         print(f"Resolving {len(ambiguous_nodes)} ambiguous + {len(low_confidence_nodes)} "
               f"low-confidence nodes via parallel batched LLM calls...")
         definite_mappings.extend(
-            _resolve_uncertain_nodes_parallel(all_uncertain, catalog_entries)
+            _resolve_uncertain_nodes_parallel(all_uncertain, catalog_entries, prompt_hints)
         )
 
     # ── Build DSComponentMapping objects ──────────────────────────────────
@@ -3046,6 +3304,7 @@ def create_workflow() -> StateGraph:
 
     workflow.add_node("ingest_figma", ingest_figma_node)
     workflow.add_node("prune_figma_tree", prune_figma_tree_node)   # Step 1b: structural pruning
+    workflow.add_node("resolve_prompt_instructions", resolve_prompt_instructions_node)  # Step 1c: prompt research
     workflow.add_node("build_ir", build_ir_node)
     workflow.add_node("map_to_ds", map_to_design_system_node)
     workflow.add_node("generate_code", generate_angular_code_node)
@@ -3055,8 +3314,9 @@ def create_workflow() -> StateGraph:
     workflow.add_node("repair", repair_node)
 
     workflow.set_entry_point("ingest_figma")
-    workflow.add_edge("ingest_figma", "prune_figma_tree")   # → pruning (was → build_ir)
-    workflow.add_edge("prune_figma_tree", "build_ir")        # → IR generation
+    workflow.add_edge("ingest_figma", "prune_figma_tree")
+    workflow.add_edge("prune_figma_tree", "resolve_prompt_instructions")  # → prompt research
+    workflow.add_edge("resolve_prompt_instructions", "build_ir")           # → IR generation
     workflow.add_edge("build_ir", "map_to_ds")
     workflow.add_edge("map_to_ds", "generate_code")
     workflow.add_edge("generate_code", "refine_typography")
@@ -3784,6 +4044,8 @@ def run_figma_to_angular(
         "ds_knowledge": knowledge,
         "phase1_research_context": None,
         "user_prompt": user_prompt or None,
+        "prompt_research_context": None,
+        "prompt_component_hints": [],
     }
 
     print("Invoking workflow...")
