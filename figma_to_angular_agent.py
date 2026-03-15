@@ -414,34 +414,6 @@ def _resolve_ambiguous_with_llm(
         for c in catalog_entries
     ]
 
-    nodes_payload = [
-        {
-            "id":          item["ir_node"].get("id"),
-            "figma_type":  item.get("figma_type", ""),
-            "ir_type":     item["ir_node"].get("type"),
-            "name":        item["ir_node"].get("name"),
-            "parent_name": item.get("parent_name", ""),
-            "children": [
-                {"name": c.get("name"), "type": c.get("type")}
-                for c in item["ir_node"].get("children", [])[:8]
-            ],
-            "inner_text":  (item["ir_node"].get("properties") or {}).get("innerText", "")[:100],
-            "has_shadow":  bool(item["ir_node"].get("styling", {}).get("effects")),
-            "has_fill":    bool(item["ir_node"].get("styling", {}).get("fills")),
-            "candidates": [
-                {
-                    "score":       s,
-                    "name":        e["name"],
-                    "selector":    e["selector"],
-                    "description": e.get("description", ""),
-                    "hints":       e.get("figma_hints", []),
-                }
-                for s, e in item["top3"]
-            ],
-        }
-        for item in ambiguous_nodes
-    ]
-
     user_preference_block = ""
     if prompt_hints:
         user_preference_block = (
@@ -451,7 +423,42 @@ def _resolve_ambiguous_with_llm(
             + "\n"
         )
 
-    prompt = f"""You are mapping Figma design nodes to design system components.
+    try:
+        def _safe_styling(ir_node):
+            styling = ir_node.get("styling")
+            return styling if isinstance(styling, dict) else {}
+
+        nodes_payload = [
+            {
+                "id":          item["ir_node"].get("id"),
+                "figma_type":  item.get("figma_type", ""),
+                "ir_type":     item["ir_node"].get("type"),
+                "name":        item["ir_node"].get("name"),
+                "parent_name": item.get("parent_name", ""),
+                "children": [
+                    {"name": c.get("name"), "type": c.get("type")}
+                    for c in item["ir_node"].get("children", [])[:8]
+                    if isinstance(c, dict)
+                ],
+                "inner_text":  (item["ir_node"].get("properties") or {}).get("innerText", "")[:100],
+                "has_shadow":  bool(_safe_styling(item["ir_node"]).get("effects")),
+                "has_fill":    bool(_safe_styling(item["ir_node"]).get("fills")),
+                "candidates": [
+                    {
+                        "score":       s,
+                        "name":        e["name"],
+                        "selector":    e["selector"],
+                        "description": e.get("description", ""),
+                        "hints":       e.get("figma_hints", []),
+                    }
+                    for s, e in item["top3"]
+                    if isinstance(e, dict)
+                ],
+            }
+            for item in ambiguous_nodes
+        ]
+
+        prompt = f"""You are mapping Figma design nodes to design system components.
 
 Available components:
 {json.dumps(catalog_summary, indent=2)}
@@ -467,7 +474,6 @@ Nodes to resolve:
 
 Output ONLY valid JSON array, no markdown fences or explanation."""
 
-    try:
         METRICS.record_llm_call(len(prompt), 0, "ambiguous_resolution")
         response = llm.invoke([
             SystemMessage(content="You map UI nodes to design system components. Output ONLY valid JSON."),
@@ -487,6 +493,7 @@ Output ONLY valid JSON array, no markdown fences or explanation."""
                     "inputs": {},
                 }
                 for r in resolutions
+                if isinstance(r, dict)
             ]
     except Exception as exc:
         print(f"Warning: Ambiguous node LLM resolution failed: {exc}")
@@ -1090,7 +1097,14 @@ Be specific. Only list components you confirmed exist in the catalog via tool ca
                 result = f"Unknown tool: {tool_name}"
             messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
 
-    research_text = getattr(messages[-1], "content", "") if messages else ""
+    _raw_content = getattr(messages[-1], "content", "") if messages else ""
+    if isinstance(_raw_content, list):
+        research_text = " ".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in _raw_content
+        )
+    else:
+        research_text = _raw_content or ""
     METRICS.record_llm_call(len(user_prompt), len(research_text), "resolve_prompt_instructions")
 
     # Extract selectors mentioned in the research output for score boosting
@@ -1390,8 +1404,14 @@ def _chunk_nodes(nodes: List[Dict], chunk_size: int) -> List[List[Dict]]:
     return [nodes[i:i + chunk_size] for i in range(0, len(nodes), chunk_size)]
 
 
-def _parse_llm_json_response(content: str) -> Any:
-    """Parse JSON from LLM response, handling markdown formatting."""
+def _parse_llm_json_response(content) -> Any:
+    """Parse JSON from LLM response, handling markdown formatting and LangChain content blocks."""
+    # LangChain AIMessage.content can be a list of content-block dicts instead of a plain string
+    if isinstance(content, list):
+        content = " ".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in content
+        )
     content = content.strip()
     if content.startswith("```"):
         parts = content.split("```")

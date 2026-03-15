@@ -27,12 +27,14 @@ export default function NgForgeIDE() {
   const [screenshotFile, setScreenshotFile] = useState(null);
   const [screenshotBase64, setScreenshotBase64] = useState(null);
   const [screenshotPreviewUrl, setScreenshotPreviewUrl] = useState(null);
-  const [activeInputTab, setActiveInputTab] = useState('prompt');
+  const [figmaExpanded, setFigmaExpanded] = useState(false);
+  const [appConfigExpanded, setAppConfigExpanded] = useState(false);
+  const [appHeadHtml, setAppHeadHtml] = useState('');
+  const [appGlobalScss, setAppGlobalScss] = useState('');
   const [chatHistory, setChatHistory] = useState([]);
   const [dsCoverage, setDsCoverage] = useState(null);
 
   // ── Preview ───────────────────────────────────────────────────────────────
-  const [previewViewport, setPreviewViewport] = useState('desktop');
   const [previewSrcdoc, setPreviewSrcdoc] = useState('');
 
   // ── Errors + state ────────────────────────────────────────────────────────
@@ -172,15 +174,41 @@ export default function NgForgeIDE() {
 
       /* Chat panel */
       .chat-panel { background: var(--bg-panel); }
-      .chat-input-tabs { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; }
-      .chat-tab {
-        padding: 8px 16px; font-size: 12px; cursor: pointer;
-        color: var(--text-dim); border-bottom: 2px solid transparent;
-        white-space: nowrap;
+      .input-sections-wrap { flex-shrink: 0; border-bottom: 1px solid var(--border); }
+      .input-section { padding: 6px 8px; }
+      .input-section + .input-section { border-top: 1px solid var(--border); }
+      .input-section-header {
+        display: flex; align-items: center; justify-content: space-between;
+        margin-bottom: 4px;
       }
-      .chat-tab.active { color: var(--text-primary); border-bottom-color: var(--accent); }
-      .chat-tab:hover:not(.active) { color: var(--text-secondary); }
-      .chat-input-area { padding: 8px; flex-shrink: 0; border-bottom: 1px solid var(--border); }
+      .section-label {
+        display: flex; align-items: center; gap: 5px;
+        font-size: 10px; font-family: var(--font-mono); color: var(--text-dim);
+        text-transform: uppercase; letter-spacing: .5px;
+      }
+      .section-label.clickable { cursor: pointer; }
+      .section-label.clickable:hover { color: var(--text-secondary); }
+      .section-toggle { font-size: 9px; }
+      .input-badge {
+        padding: 1px 5px; font-size: 10px; border-radius: 2px;
+        background: rgba(0,212,170,.15); color: var(--accent); border: 1px solid rgba(0,212,170,.3);
+      }
+      .section-clear-btn {
+        background: none; border: none; color: var(--text-dim); cursor: pointer;
+        font-size: 11px; padding: 0 2px; line-height: 1;
+      }
+      .section-clear-btn:hover { color: var(--error); }
+      .screenshot-compact {
+        display: flex; align-items: center; gap: 6px;
+        border: 1px dashed var(--border); padding: 5px 8px;
+        cursor: pointer; font-size: 11px; color: var(--text-dim);
+        font-family: var(--font-mono);
+      }
+      .screenshot-compact.has-file { border-color: var(--border-active); color: var(--text-secondary); }
+      .screenshot-compact.drag-over { border-color: var(--accent); color: var(--accent); }
+      .screenshot-compact:hover:not(.has-file) { border-color: var(--border-active); }
+      .screenshot-thumb { width: 28px; height: 28px; object-fit: cover; border: 1px solid var(--border); flex-shrink: 0; }
+      .screenshot-filename { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
       .chat-textarea {
         width: 100%; background: var(--bg-tertiary); color: var(--text-primary);
         border: 1px solid var(--border); padding: 8px;
@@ -225,14 +253,6 @@ export default function NgForgeIDE() {
       .coverage-fill { height: 100%; background: var(--accent); transition: width .4s; }
       .coverage-uncovered { font-family: var(--font-mono); font-size: 10px; color: var(--text-dim); margin-top: 2px; }
 
-      /* Drop zone (screenshot) */
-      .drop-zone {
-        border: 1px dashed var(--border); padding: 20px 12px;
-        text-align: center; cursor: pointer; color: var(--text-dim); font-size: 12px;
-        margin-bottom: 6px;
-      }
-      .drop-zone.drag-over { border-color: var(--accent); color: var(--accent); }
-      .screenshot-preview { max-width: 100%; max-height: 120px; display: block; margin: 0 auto 6px; border: 1px solid var(--border); }
 
       /* Editor panel */
       .editor-panel { background: var(--bg-primary); }
@@ -324,6 +344,7 @@ export default function NgForgeIDE() {
         flex-shrink: 0; margin-top: 1px;
       }
       .error-badge.api  { background: rgba(224,80,80,.2);  color: var(--error); }
+      .error-badge.ng   { background: rgba(224,80,80,.2);  color: var(--error); }
       .error-badge.scss { background: rgba(240,160,32,.2); color: var(--warning); }
       .error-badge.js   { background: rgba(240,120,32,.2); color: #f07820; }
       .error-msg { color: var(--text-secondary); word-break: break-all; }
@@ -526,35 +547,180 @@ export default function NgForgeIDE() {
   }, [session, prompt, isGenerating, handleGenerate, handleRefine]);
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // 6. PREVIEW SRCDOC BUILDER
+  // 6. PREVIEW SRCDOC BUILDER  (Angular JIT runtime)
   // ═══════════════════════════════════════════════════════════════════════════
   useEffect(() => {
     if (!files.html && !files.scss) { setPreviewSrcdoc(''); return; }
-    const scss = (files.scss || '').replace(/`/g, '\\`').replace(/\$/g, '\\$');
-    const html = files.html || '';
+
+    // Escape for embedding inside a JS template literal (within the srcdoc)
+    const esc = (s) => (s || '').replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\$/g, '\\$');
+    const safeHtml      = esc(files.html);
+    const safeCompScss  = esc(files.scss);
+    const safeGlobalScss = esc(appGlobalScss);
+    // appHeadHtml goes directly into the HTML string — only escape backticks to
+    // prevent breaking the outer JS template literal
+    const rawHeadHtml = (appHeadHtml || '').replace(/`/g, '\\`');
+
+    // ── Version pins ─────────────────────────────────────────────────────
+    const V_NG  = '17.3.12';
+    const V_CDK = '17.3.10';
+    const V_PNG = '17.18.0';
+
+    const BASE_EXT = '@angular/core,@angular/common,@angular/forms,@angular/animations,@angular/cdk,@angular/platform-browser,rxjs,tslib';
+    const PNG_EXT  = `${BASE_EXT},primeng/api`;
+
+    const pngMods = [
+      'api','button','inputtext','inputtextarea','inputnumber',
+      'card','panel','fieldset','divider','scrollpanel',
+      'dialog','sidebar','overlaypanel','confirmdialog',
+      'dropdown','multiselect','selectbutton','togglebutton',
+      'checkbox','radiobutton','inputswitch','autocomplete',
+      'calendar','slider','chips','rating','knob',
+      'table','tabview','accordion',
+      'breadcrumb','menubar','menu','contextmenu','toolbar',
+      'toast','messages','message','progressbar','progressspinner',
+      'tag','badge','chip','avatar','image','timeline',
+      'fileupload','steps','tabmenu','splitbutton','galleria',
+    ];
+
+    const ngBase = `https://esm.sh/@angular`;
+    const cdkBase = `${ngBase}/cdk@${V_CDK}`;
+    const importmap = {
+      imports: {
+        'tslib':        'https://esm.sh/tslib@2.7.0',
+        'rxjs':         'https://esm.sh/rxjs@7.8.1',
+        'rxjs/operators':'https://esm.sh/rxjs@7.8.1/operators',
+        '@angular/core':                       `${ngBase}/core@${V_NG}`,
+        '@angular/core/primitives/signals':    `${ngBase}/core@${V_NG}/primitives/signals`,
+        '@angular/common':                     `${ngBase}/common@${V_NG}`,
+        '@angular/compiler':                   `${ngBase}/compiler@${V_NG}`,
+        '@angular/platform-browser':           `${ngBase}/platform-browser@${V_NG}`,
+        '@angular/platform-browser/animations':`${ngBase}/platform-browser@${V_NG}/animations`,
+        '@angular/platform-browser-dynamic':   `${ngBase}/platform-browser-dynamic@${V_NG}`,
+        '@angular/forms':                      `${ngBase}/forms@${V_NG}`,
+        '@angular/animations':                 `${ngBase}/animations@${V_NG}`,
+        '@angular/animations/browser':         `${ngBase}/animations@${V_NG}/browser`,
+        '@angular/cdk':                `${cdkBase}`,
+        '@angular/cdk/bidi':           `${cdkBase}/bidi`,
+        '@angular/cdk/coercion':       `${cdkBase}/coercion`,
+        '@angular/cdk/collections':    `${cdkBase}/collections`,
+        '@angular/cdk/keycodes':       `${cdkBase}/keycodes`,
+        '@angular/cdk/layout':         `${cdkBase}/layout`,
+        '@angular/cdk/observers':      `${cdkBase}/observers`,
+        '@angular/cdk/overlay':        `${cdkBase}/overlay`,
+        '@angular/cdk/platform':       `${cdkBase}/platform`,
+        '@angular/cdk/portal':         `${cdkBase}/portal`,
+        '@angular/cdk/scrolling':      `${cdkBase}/scrolling`,
+        '@angular/cdk/text-field':     `${cdkBase}/text-field`,
+        ...Object.fromEntries(pngMods.map(m => [
+          `primeng/${m}`,
+          `https://esm.sh/primeng@${V_PNG}/${m}?external=${m === 'api' ? BASE_EXT : PNG_EXT}`,
+        ])),
+      },
+    };
+
+    const pngModuleNames = pngMods
+      .filter(m => m !== 'api')
+      .map(m => m.charAt(0).toUpperCase() + m.slice(1) + 'Module');
+
     const srcdoc = `<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+${rawHeadHtml}
+<style>
+  *{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif}
+  #ng-loading{display:flex;align-items:center;justify-content:center;height:100vh;
+    font-family:monospace;font-size:13px;color:#666;flex-direction:column;gap:8px}
+  .ng-spinner{width:20px;height:20px;border:2px solid #333;border-top-color:#00d4aa;
+    border-radius:50%;animation:spin .8s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/zone.js@0.14.10/dist/zone.min.js"><\/script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/sass.js/0.11.1/sass.sync.min.js"><\/script>
-<style id="s"></style>
+<script type="importmap">${JSON.stringify(importmap)}<\/script>
 </head><body>
-${html}
+<div id="ng-loading"><div class="ng-spinner"></div><span>Loading Angular preview…</span></div>
+<preview-root></preview-root>
 <script>
-Sass.compile(\`${scss}\`, function(r){
-  if(r.status===0){ document.getElementById('s').textContent=r.text; }
-  else { window.parent.postMessage({type:'iframe-error',message:r.formatted||r.message},'*'); }
+// Compile global SCSS (styles.scss equivalent) — injected into <head> at runtime
+window.__globalCssReady = new Promise(function(resolve) {
+  var s = \`${safeGlobalScss}\`;
+  if (!s.trim()) { resolve(''); return; }
+  Sass.compile(s, function(r) {
+    if (r.status === 0) { resolve(r.text); }
+    else { window.parent.postMessage({type:'iframe-error',message:r.formatted||r.message},'*'); resolve(''); }
+  });
 });
-window.onerror=function(m,s,l){ window.parent.postMessage({type:'iframe-error',message:m,line:l},'*'); return true; };
+// Compile component SCSS — applied as component styles
+window.__compCssReady = new Promise(function(resolve) {
+  var s = \`${safeCompScss}\`;
+  if (!s.trim()) { resolve(''); return; }
+  Sass.compile(s, function(r) {
+    if (r.status === 0) { resolve(r.text); }
+    else { window.parent.postMessage({type:'iframe-error',message:r.formatted||r.message},'*'); resolve(''); }
+  });
+});
+window.onerror = function(m,s,l) {
+  window.parent.postMessage({type:'iframe-error',message:m,line:l},'*');
+  return true;
+};
+<\/script>
+<script type="module">
+import '@angular/compiler';
+
+import { Component } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { FormsModule, ReactiveFormsModule } from '@angular/forms';
+import { bootstrapApplication } from '@angular/platform-browser';
+import { provideAnimations } from '@angular/platform-browser/animations';
+import { MessageService, ConfirmationService } from 'primeng/api';
+${pngMods.filter(m => m !== 'api').map(m =>
+  `import { ${m.charAt(0).toUpperCase()+m.slice(1)}Module } from 'primeng/${m}';`
+).join('\n')}
+
+const [globalCss, compiledCss] = await Promise.all([window.__globalCssReady, window.__compCssReady]);
+
+// Inject global styles into <head> — mirrors Angular's styles.scss
+if (globalCss) {
+  const gs = document.createElement('style');
+  gs.id = 'global-styles';
+  gs.textContent = globalCss;
+  document.head.appendChild(gs);
+}
+
+const PreviewComponent = Component({
+  selector: 'preview-root',
+  standalone: true,
+  template: \`${safeHtml}\`,
+  styles: [compiledCss],
+  imports: [
+    CommonModule, FormsModule, ReactiveFormsModule,
+    ${pngModuleNames.join(', ')},
+  ],
+})(class PreviewComponent {});
+
+try {
+  await bootstrapApplication(PreviewComponent, {
+    providers: [provideAnimations(), MessageService, ConfirmationService],
+  });
+  document.getElementById('ng-loading')?.remove();
+} catch(err) {
+  window.parent.postMessage({type:'iframe-error',message:'Angular: '+err.toString()},'*');
+  const el = document.getElementById('ng-loading');
+  if (el) el.innerHTML = '<span style="color:#e05050">Bootstrap error — see console</span>';
+}
 <\/script>
 </body></html>`;
+
     setPreviewSrcdoc(srcdoc);
-  }, [files.html, files.scss]);
+  }, [files.html, files.scss, appHeadHtml, appGlobalScss]);
 
   // Iframe message listener
   useEffect(() => {
     const handler = (e) => {
       if (e.data?.type === 'iframe-error') {
-        pushError('SCSS', e.data.message + (e.data.line ? ` (line ${e.data.line})` : ''));
+        pushError('NG', e.data.message + (e.data.line ? ` (line ${e.data.line})` : ''));
       }
     };
     window.addEventListener('message', handler);
@@ -722,82 +888,159 @@ window.onerror=function(m,s,l){ window.parent.postMessage({type:'iframe-error',m
 
   const renderChatPanel = () => (
     <div className="panel chat-panel" style={{ width: `${leftWidth}%` }}>
-      {/* Input tabs */}
-      <div className="chat-input-tabs">
-        {['prompt', 'figma', 'screenshot'].map(t => (
-          <div
-            key={t}
-            className={`chat-tab ${activeInputTab === t ? 'active' : ''}`}
-            onClick={() => !isGenerating && setActiveInputTab(t)}
-          >
-            {t === 'prompt' ? 'Prompt' : t === 'figma' ? 'Figma JSON' : 'Screenshot'}
-          </div>
-        ))}
-      </div>
+      {/* Stacked input sections */}
+      <div className="input-sections-wrap">
 
-      {/* Input area */}
-      <div className="chat-input-area">
-        {activeInputTab === 'prompt' && (
+        {/* ── Prompt ── */}
+        <div className="input-section">
+          <div className="input-section-header">
+            <span className="section-label">Prompt</span>
+          </div>
           <textarea
             className="chat-textarea"
-            rows={5}
-            placeholder="Describe the component to generate or refine…&#10;&#10;Cmd/Ctrl+Enter to send"
+            rows={4}
+            placeholder={"Describe the component…\n\nCmd/Ctrl+Enter to send"}
             value={prompt}
             onChange={e => setPrompt(e.target.value)}
             onKeyDown={handlePromptKeyDown}
             disabled={isGenerating}
           />
-        )}
-        {activeInputTab === 'figma' && (
-          <textarea
-            className="chat-textarea"
-            rows={5}
-            placeholder='Paste Figma JSON tree here…'
-            value={figmaJsonText}
-            onChange={e => {
-              const val = e.target.value;
-              setFigmaJsonText(val);
-              if (val.trim()) {
-                const file = new File(
-                  [new Blob([val], { type: 'application/json' })],
-                  'figma.json',
-                  { type: 'application/json' }
-                );
-                setFigmaFile(file);
-              } else {
-                setFigmaFile(null);
-              }
-            }}
-            disabled={isGenerating}
-          />
-        )}
-        {activeInputTab === 'screenshot' && (
-          <div>
-            {screenshotPreviewUrl && (
-              <img src={screenshotPreviewUrl} alt="screenshot" className="screenshot-preview" />
-            )}
-            <div
-              className={`drop-zone ${dropOver ? 'drag-over' : ''}`}
-              onClick={() => fileInputRef.current?.click()}
-              onDragOver={e => { e.preventDefault(); setDropOver(true); }}
-              onDragLeave={() => setDropOver(false)}
-              onDrop={e => {
-                e.preventDefault(); setDropOver(false);
-                const f = e.dataTransfer.files[0];
-                if (f) handleScreenshotFile(f);
-              }}
+        </div>
+
+        {/* ── Figma JSON ── */}
+        <div className="input-section">
+          <div className="input-section-header">
+            <span
+              className="section-label clickable"
+              onClick={() => !isGenerating && setFigmaExpanded(v => !v)}
             >
-              {screenshotFile ? screenshotFile.name : 'Drop PNG/JPG or click to browse'}
-            </div>
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="image/*"
-              style={{ display: 'none' }}
-              onChange={e => { if (e.target.files[0]) handleScreenshotFile(e.target.files[0]); }}
-            />
+              <span className="section-toggle">{figmaExpanded ? '▾' : '▸'}</span>
+              Figma JSON
+              {figmaFile && <span className="input-badge">loaded</span>}
+            </span>
+            {figmaFile && (
+              <button
+                className="section-clear-btn"
+                onClick={() => { setFigmaJsonText(''); setFigmaFile(null); }}
+                disabled={isGenerating}
+                title="Clear"
+              >×</button>
+            )}
           </div>
-        )}
+          {figmaExpanded && (
+            <textarea
+              className="chat-textarea"
+              rows={5}
+              placeholder="Paste Figma JSON tree here…"
+              value={figmaJsonText}
+              onChange={e => {
+                const val = e.target.value;
+                setFigmaJsonText(val);
+                if (val.trim()) {
+                  setFigmaFile(new File(
+                    [new Blob([val], { type: 'application/json' })],
+                    'figma.json',
+                    { type: 'application/json' }
+                  ));
+                } else {
+                  setFigmaFile(null);
+                }
+              }}
+              disabled={isGenerating}
+            />
+          )}
+        </div>
+
+        {/* ── Screenshot ── */}
+        <div className="input-section">
+          <div className="input-section-header">
+            <span className="section-label">Screenshot</span>
+            {screenshotFile && (
+              <button
+                className="section-clear-btn"
+                onClick={() => {
+                  setScreenshotFile(null);
+                  setScreenshotBase64(null);
+                  if (screenshotPreviewUrl) URL.revokeObjectURL(screenshotPreviewUrl);
+                  setScreenshotPreviewUrl(null);
+                }}
+                disabled={isGenerating}
+                title="Clear"
+              >×</button>
+            )}
+          </div>
+          <div
+            className={`screenshot-compact ${screenshotFile ? 'has-file' : ''} ${dropOver ? 'drag-over' : ''}`}
+            onClick={() => !isGenerating && fileInputRef.current?.click()}
+            onDragOver={e => { e.preventDefault(); setDropOver(true); }}
+            onDragLeave={() => setDropOver(false)}
+            onDrop={e => {
+              e.preventDefault(); setDropOver(false);
+              const f = e.dataTransfer.files[0];
+              if (f && !isGenerating) handleScreenshotFile(f);
+            }}
+          >
+            {screenshotPreviewUrl
+              ? <><img src={screenshotPreviewUrl} alt="" className="screenshot-thumb" /><span className="screenshot-filename">{screenshotFile?.name}</span></>
+              : <span>↑ Drop image or click to browse</span>
+            }
+          </div>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            style={{ display: 'none' }}
+            onChange={e => { if (e.target.files[0]) handleScreenshotFile(e.target.files[0]); }}
+          />
+        </div>
+
+        {/* ── App Config ── */}
+        <div className="input-section">
+          <div className="input-section-header">
+            <span
+              className="section-label clickable"
+              onClick={() => setAppConfigExpanded(v => !v)}
+            >
+              <span className="section-toggle">{appConfigExpanded ? '▾' : '▸'}</span>
+              App Config
+              {(appHeadHtml || appGlobalScss) && <span className="input-badge">set</span>}
+            </span>
+            {(appHeadHtml || appGlobalScss) && (
+              <button
+                className="section-clear-btn"
+                onClick={() => { setAppHeadHtml(''); setAppGlobalScss(''); }}
+                title="Clear config"
+              >×</button>
+            )}
+          </div>
+          {appConfigExpanded && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+              <div style={{ fontSize: '10px', color: 'var(--text-dim)', fontFamily: 'var(--font-mono)', padding: '2px 0' }}>
+                index.html &lt;head&gt; — CDN links, scripts
+              </div>
+              <textarea
+                className="chat-textarea"
+                rows={3}
+                placeholder={'<link rel="stylesheet" href="...">\n<script src="..."><\/script>'}
+                value={appHeadHtml}
+                onChange={e => setAppHeadHtml(e.target.value)}
+                disabled={isGenerating}
+              />
+              <div style={{ fontSize: '10px', color: 'var(--text-dim)', fontFamily: 'var(--font-mono)', padding: '2px 0' }}>
+                styles.scss — global styles
+              </div>
+              <textarea
+                className="chat-textarea"
+                rows={3}
+                placeholder={'/* global styles */\nbody { background: #fff; }'}
+                value={appGlobalScss}
+                onChange={e => setAppGlobalScss(e.target.value)}
+                disabled={isGenerating}
+              />
+            </div>
+          )}
+        </div>
+
       </div>
 
       {/* Buttons */}
@@ -942,14 +1185,6 @@ window.onerror=function(m,s,l){ window.parent.postMessage({type:'iframe-error',m
   );
 
   // ── Preview Panel ───────────────────────────────────────────────────────────
-  const VIEWPORTS = [
-    { key: 'mobile',   label: 'Mobile',   width: '375px' },
-    { key: 'tablet',   label: 'Tablet',   width: '768px' },
-    { key: 'desktop',  label: 'Desktop',  width: '100%' },
-  ];
-
-  const iframeWidth = VIEWPORTS.find(v => v.key === previewViewport)?.width || '100%';
-
   const handleRefreshPreview = useCallback(() => {
     const saved = previewSrcdoc;
     setPreviewSrcdoc('');
@@ -968,17 +1203,9 @@ window.onerror=function(m,s,l){ window.parent.postMessage({type:'iframe-error',m
     <div className="panel preview-panel" style={{ width: `${rightWidth}%` }}>
       {/* Toolbar */}
       <div className="preview-toolbar">
-        <div className="viewport-btns">
-          {VIEWPORTS.map(({ key, label }) => (
-            <button
-              key={key}
-              className={`viewport-btn ${previewViewport === key ? 'active' : ''}`}
-              onClick={() => setPreviewViewport(key)}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
+        <span style={{ fontSize: '11px', color: 'var(--text-dim)', fontFamily: 'var(--font-mono)' }}>
+          Desktop Preview
+        </span>
         <div style={{ display: 'flex', gap: '6px' }}>
           <button className="btn" style={{ padding: '2px 8px', fontSize: '11px' }} onClick={handleRefreshPreview} disabled={!previewSrcdoc}>
             Refresh
@@ -1002,13 +1229,12 @@ window.onerror=function(m,s,l){ window.parent.postMessage({type:'iframe-error',m
               <iframe
                 ref={iframeRef}
                 srcDoc={previewSrcdoc}
-                sandbox="allow-scripts"
+                sandbox="allow-scripts allow-same-origin"
                 style={{
-                  width: iframeWidth,
+                  width: '100%',
                   height: '100%',
                   border: 'none',
                   display: 'block',
-                  maxWidth: '100%',
                 }}
                 title="preview"
               />
