@@ -73,6 +73,8 @@ class Config:
     ENABLE_TREE_PRUNING = True   # Optimization B: prune structural noise before IR generation
     TIER23_BATCH_SIZE = 50       # Max nodes per parallel LLM sub-batch (Tier 2+3)
     FAST_MODE = False            # Optimization D: lower thresholds, larger chunks, no Tier 2+3 LLM
+    DEEP_VALIDATE_DS = True      # Set False to disable the LLM deep-validate node entirely
+    DEEP_VALIDATE_MAX_ROUNDS = 10  # Max tool-calling rounds (skipped entirely if FAST_MODE=True)
 
 
 # ============================================================================
@@ -863,6 +865,24 @@ class ValidationError(BaseModel):
     suggestion: Optional[str] = None
 
 
+class DSValidationFinding(BaseModel):
+    """Single finding from the LLM deep-validation pass."""
+    check_type: str          # selector | base_class | variant_class | directive
+                             # | import | utility_class | inner_html
+    selector: str            # DS selector or utility class this finding concerns
+    file_path: str           # "html" | "typescript" | "scss"
+    message: str
+    line: Optional[int] = None
+    suggestion: Optional[str] = None
+
+
+class DSValidationFindings(BaseModel):
+    """Structured output from deep_validate_ds_usage_node."""
+    findings: List[DSValidationFinding] = []
+    checked_selectors: List[str] = []
+    skipped_checks: List[str] = []
+
+
 # ============================================================================
 # STATE DEFINITION
 # ============================================================================
@@ -1023,6 +1043,64 @@ def utility_class_lookup(concept: str) -> str:
 _PROMPT_INSTRUCTION_TOOLS = [catalog_lookup, component_docs_lookup, utility_class_lookup]
 
 
+@lc_tool
+def get_catalog_entry(selector: str) -> str:
+    """Look up a design system component's full catalog entry by selector or name.
+
+    Returns base_classes, variant_class_map, directives, import_statement,
+    component_classes, and inner_html_note so the validator can check usage correctness.
+    """
+    if not DS_CATALOG_ENTRY_MAP:
+        return "Catalog not loaded."
+    key = selector.lower().strip()
+    entry = DS_CATALOG_ENTRY_MAP.get(key)
+    if not entry:
+        for k, v in DS_CATALOG_ENTRY_MAP.items():
+            if key in k or k in key:
+                entry = v
+                break
+    if not entry:
+        available = sorted({v.get("selector", "") or v.get("name", "")
+                            for v in DS_CATALOG_ENTRY_MAP.values()})[:25]
+        return f"Not found: '{selector}'. Available selectors: {', '.join(available)}"
+    return json.dumps(entry, indent=2)
+
+
+@lc_tool
+def validate_utility_class(class_name: str) -> str:
+    """Check whether a utility class exists in the design system knowledge base.
+
+    Pass the class name without the leading dot (e.g. 'flex', 'p-2', 'text-primary').
+    Returns the description and section path on a hit, or nearest partial matches on a miss.
+    """
+    if not DOC_KNOWLEDGE:
+        return "Utility class knowledge not loaded for this design system."
+    query = class_name.lower().strip().lstrip(".")
+    # Exact match first
+    for sec_name, sec_data in DOC_KNOWLEDGE.get("sections", {}).items():
+        for entry_key, entry_data in sec_data.items():
+            classes = entry_data.get("classes", {})
+            if query in classes:
+                return f"Found: .{query} — {classes[query]}  [{sec_name}/{entry_key}]"
+    # Partial match (up to 8)
+    partials = []
+    for sec_name, sec_data in DOC_KNOWLEDGE.get("sections", {}).items():
+        for entry_key, entry_data in sec_data.items():
+            for cls, desc in entry_data.get("classes", {}).items():
+                if query in cls or cls in query:
+                    partials.append(f".{cls} — {desc}  [{sec_name}/{entry_key}]")
+                if len(partials) >= 8:
+                    break
+            if len(partials) >= 8:
+                break
+        if len(partials) >= 8:
+            break
+    if partials:
+        return f"No exact match for '.{class_name}'. Nearest:\n" + "\n".join(partials)
+    sections = list(DOC_KNOWLEDGE.get("sections", {}).keys())
+    return f"Class '.{class_name}' not found. Available sections: {', '.join(sections)}"
+
+
 def resolve_prompt_instructions_node(state: AgentState) -> AgentState:
     """Pre-IR node: research catalog + docs for any DS components / utility classes
     mentioned in the user prompt.
@@ -1076,7 +1154,7 @@ Be specific. Only list components you confirmed exist in the catalog via tool ca
         HumanMessage(content=f"User instructions:\n{user_prompt}"),
     ]
 
-    max_rounds = 6
+    max_rounds = 10
     for _ in range(max_rounds):
         response = llm_with_tools.invoke(messages)
         messages.append(response)
@@ -2363,6 +2441,13 @@ def fetch_component_docs(component: str, doc_type: str = "api") -> str:
 
 _PHASE1_TOOLS_LIST = [search_doc_knowledge, fetch_doc_page, fetch_component_docs]
 
+_DEEP_VALIDATE_TOOLS = [
+    get_catalog_entry,
+    validate_utility_class,
+    fetch_component_docs,
+    fetch_doc_page,
+]
+
 
 def _build_phase1_design_summary(ir_tree: List[Dict], max_items: int = 30) -> str:
     """Build a compact (~20-40 line) design outline to drive Phase 1 class searches."""
@@ -3126,6 +3211,220 @@ def fix_imports_directives_node(state: AgentState) -> AgentState:
 
 
 # ============================================================================
+# STEP 5b: DEEP DS VALIDATION (LLM-powered, runs after validate_node)
+# ============================================================================
+
+def deep_validate_ds_usage_node(state: AgentState) -> AgentState:
+    """Step 5b: LLM-powered deep validation of DS usage correctness.
+
+    Verifies that base_classes, variant_classes, directives, imports, utility
+    classes, and inner_html structure are correct per the catalog.  Findings are
+    appended to state['validation_errors'] (never reset — validate_node owns that).
+
+    Skipped entirely when FAST_MODE=True or DEEP_VALIDATE_DS=False.
+    """
+    if Config.FAST_MODE:
+        print("deep_validate_ds: skipped (fast mode)")
+        return state
+    if not Config.DEEP_VALIDATE_DS:
+        print("deep_validate_ds: skipped (DEEP_VALIDATE_DS=False)")
+        return state
+
+    generated = state.get("generated")
+    if not generated or not generated.files:
+        print("deep_validate_ds: skipped (no generated files)")
+        return state
+
+    catalog_entries = state.get("ds_catalog_entries") or []
+    if not DS_CATALOG_ENTRY_MAP:
+        print("deep_validate_ds: skipped (empty catalog)")
+        return state
+
+    METRICS.start_step("deep_validate_ds")
+
+    # ── Determine which checks have catalog data to back them ─────────────────
+    any_base_classes  = any(e.get("base_classes")      for e in catalog_entries)
+    any_variant_map   = any(e.get("variant_class_map") for e in catalog_entries)
+    any_directives    = any(e.get("directives")        for e in catalog_entries)
+    any_imports       = any(e.get("import_statement")  for e in catalog_entries)
+    any_inner_html    = any(e.get("inner_html_note")   for e in catalog_entries)
+    has_knowledge     = bool(DOC_KNOWLEDGE)
+
+    checks_enabled: List[str] = ["selector"]
+    skipped_checks: List[str] = []
+    if any_base_classes:
+        checks_enabled.append("base_class")
+    else:
+        skipped_checks.append("base_class")
+    if any_variant_map:
+        checks_enabled.append("variant_class")
+    else:
+        skipped_checks.append("variant_class")
+    if any_directives:
+        checks_enabled.append("directive")
+    else:
+        skipped_checks.append("directive")
+    if any_imports:
+        checks_enabled.append("import")
+    else:
+        skipped_checks.append("import")
+    if has_knowledge:
+        checks_enabled.append("utility_class")
+    else:
+        skipped_checks.append("utility_class")
+    if any_inner_html:
+        checks_enabled.append("inner_html")
+    else:
+        skipped_checks.append("inner_html")
+
+    # ── Extract file contents ─────────────────────────────────────────────────
+    html_content = ts_content = scss_content = ""
+    for f in generated.files:
+        if f.file_type in ("html", "template") or f.path.endswith(".html"):
+            html_content = f.content
+        elif f.file_type == "typescript" or f.path.endswith(".ts"):
+            ts_content = f.content
+        elif f.file_type in ("scss", "css") or f.path.endswith((".scss", ".css")):
+            scss_content = f.content
+
+    # ── Collect DS selectors actually present in HTML ─────────────────────────
+    import re as _re
+    all_tags = set(_re.findall(r"<([a-zA-Z][\w-]*)", html_content))
+    catalog_selectors_in_html = sorted(
+        t for t in all_tags
+        if t.lower() in DS_CATALOG_ENTRY_MAP
+    )
+
+    ds_config = state.get("ds_config") or {}
+    ds_name = ds_config.get("name", "the design system")
+    selector_list = [e.get("selector", "") for e in catalog_entries if e.get("selector")]
+
+    # ── Build system prompt ───────────────────────────────────────────────────
+    check_descriptions = {
+        "selector":      "Every DS tag in HTML is a real catalog selector (use get_catalog_entry to verify).",
+        "base_class":    "Required base_classes[] from the catalog entry are present on the element.",
+        "variant_class": "variant_class_map{} classes match the element's variant/severity/size.",
+        "directive":     "Attribute directives from directives[] are placed on the correct elements.",
+        "import":        "import_statement is present in the TS file; component class is in @Component.imports.",
+        "utility_class": "Every non-BEM utility class in HTML exists in the knowledge base (use validate_utility_class).",
+        "inner_html":    "Inner content structure matches inner_html_note from the catalog entry.",
+    }
+    enabled_check_lines = "\n".join(
+        f"  {i+1}. [{c}] {check_descriptions[c]}"
+        for i, c in enumerate(checks_enabled)
+    )
+
+    system = f"""You are a strict {ds_name} design system validator.
+
+Your task is to verify that the generated Angular component files correctly use {ds_name}
+components, base classes, variant classes, directives, imports, utility classes, and
+inner HTML structure — exactly as documented in the catalog.
+
+Available catalog selectors: {', '.join(selector_list[:30]) if selector_list else '(none)'}
+DS selectors detected in the HTML: {', '.join(catalog_selectors_in_html) if catalog_selectors_in_html else '(none)'}
+
+Enabled checks (skipped checks have no catalog data): {', '.join(checks_enabled)}
+Skipped: {', '.join(skipped_checks) if skipped_checks else 'none'}
+
+Checks to perform:
+{enabled_check_lines}
+
+Tools available:
+- get_catalog_entry(selector) — returns full catalog entry including base_classes,
+  variant_class_map, directives, import_statement, inner_html_note
+- validate_utility_class(class_name) — confirms a utility class exists in the knowledge base
+- fetch_component_docs(component, doc_type) — live docs for edge cases
+- fetch_doc_page(url) — deeper doc confirmation
+
+Instructions:
+1. For EACH DS selector found in the HTML, call get_catalog_entry to retrieve its spec.
+2. Cross-check every enabled check type against the actual code.
+3. Only call validate_utility_class for non-BEM classes (ones without a DS prefix and
+   not obviously Angular classes like ngClass, ngIf, etc.).
+4. Report ONLY genuine violations — not style suggestions.
+5. When you have finished all checks, state your findings clearly."""
+
+    messages: List[Any] = [
+        SystemMessage(content=system),
+        HumanMessage(content=(
+            f"HTML:\n```html\n{html_content}\n```\n\n"
+            f"TypeScript:\n```typescript\n{ts_content}\n```\n\n"
+            + (f"SCSS:\n```scss\n{scss_content}\n```\n\n" if scss_content else "")
+            + "Please verify all enabled checks now."
+        )),
+    ]
+
+    # ── Tool-calling loop ─────────────────────────────────────────────────────
+    llm = ChatOpenAI(model=Config.LLM_MODEL, temperature=0.0, api_key=Config.OPENAI_API_KEY)
+    llm_with_tools = llm.bind_tools(_DEEP_VALIDATE_TOOLS)
+    tool_fn_map = {t.name: t for t in _DEEP_VALIDATE_TOOLS}
+
+    for i in range(Config.DEEP_VALIDATE_MAX_ROUNDS):
+        response = llm_with_tools.invoke(messages)
+        messages.append(response)
+        tool_calls = getattr(response, "tool_calls", []) or []
+        if not tool_calls:
+            break
+        names = [tc["name"] for tc in tool_calls]
+        print(f"  deep_validate_ds round {i+1}: tools called: {names}")
+        for tc in tool_calls:
+            fn = tool_fn_map.get(tc["name"])
+            if fn:
+                try:
+                    result = fn.invoke(tc["args"])
+                except Exception as exc:
+                    result = f"Tool error: {exc}"
+            else:
+                result = f"Unknown tool: {tc['name']}"
+            messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+    else:
+        print(f"  deep_validate_ds: max rounds ({Config.DEEP_VALIDATE_MAX_ROUNDS}) reached")
+
+    print(f"  deep_validate_ds: tool loop done in {i+1} iteration(s)")
+
+    # ── Structured extraction pass ────────────────────────────────────────────
+    findings_obj = DSValidationFindings(skipped_checks=skipped_checks)
+    try:
+        structured_llm = llm.with_structured_output(DSValidationFindings)
+        messages.append(HumanMessage(content="Return all findings as structured output now."))
+        raw = structured_llm.invoke(messages)
+        if isinstance(raw, DSValidationFindings):
+            findings_obj = raw
+            findings_obj.skipped_checks = skipped_checks
+    except Exception as exc:
+        print(f"  deep_validate_ds: structured extraction failed: {exc}")
+
+    # ── Metrics ───────────────────────────────────────────────────────────────
+    total_in  = sum(len(str(getattr(m, "content", ""))) for m in messages)
+    last_out  = str(getattr(messages[-1], "content", ""))
+    METRICS.record_llm_call(total_in, len(last_out), "deep_validate_ds")
+
+    # ── Convert findings → ValidationError and append (never reset) ──────────
+    new_errors = [
+        ValidationError(
+            file_path=f.file_path,
+            error_type=f"ds_{f.check_type}_violation",
+            message=f.message,
+            line=f.line,
+            suggestion=f.suggestion,
+        )
+        for f in findings_obj.findings
+    ]
+
+    if new_errors:
+        print(f"  deep_validate_ds: {len(new_errors)} finding(s): "
+              f"{[e.error_type for e in new_errors]}")
+    else:
+        print("  deep_validate_ds: no violations found")
+
+    existing = state.get("validation_errors") or []
+    state["validation_errors"] = existing + new_errors
+
+    METRICS.end_step("deep_validate_ds")
+    return state
+
+
+# ============================================================================
 # STEP 5: VALIDATE
 # ============================================================================
 
@@ -3331,6 +3630,7 @@ def create_workflow() -> StateGraph:
     workflow.add_node("refine_typography", refine_typography_node)
     workflow.add_node("fix_imports", fix_imports_directives_node)
     workflow.add_node("validate", validate_node)
+    workflow.add_node("deep_validate_ds", deep_validate_ds_usage_node)
     workflow.add_node("repair", repair_node)
 
     workflow.set_entry_point("ingest_figma")
@@ -3342,8 +3642,9 @@ def create_workflow() -> StateGraph:
     workflow.add_edge("generate_code", "refine_typography")
     workflow.add_edge("refine_typography", "fix_imports")
     workflow.add_edge("fix_imports", "validate")
+    workflow.add_edge("validate", "deep_validate_ds")
     workflow.add_conditional_edges(
-        "validate",
+        "deep_validate_ds",
         should_repair,
         {"repair": "repair", "complete": END},
     )
