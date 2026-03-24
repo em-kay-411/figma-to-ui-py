@@ -127,15 +127,17 @@ def build_catalog_code_gen_prompt(catalog: Dict) -> str:
         dir_note = f" [directives: {', '.join(dir_selectors)}]" if dir_selectors else ""
         note = c.get("inner_html_note", "")
         inner_note = f" | inner: {note}" if note else ""
+        cg_instr = c.get("code_gen_instructions", "")
+        instr_note = f" | INSTRUCTIONS: {cg_instr}" if cg_instr else ""
 
         if selector.lower() in _NATIVE_HTML_TAGS:
             # Directive-based: native HTML element + DS directives/classes
             directive_lines.append(
-                f"- {hints} → <{selector}> (native HTML + {dir_note.strip()} + resolved_classes) ({desc}){inner_note}"
+                f"- {hints} → <{selector}> (native HTML + {dir_note.strip()} + resolved_classes) ({desc}){inner_note}{instr_note}"
             )
         else:
             custom_tags.append(selector)
-            component_lines.append(f"- {hints} → <{selector}> ({desc}){dir_note}{inner_note}")
+            component_lines.append(f"- {hints} → <{selector}> ({desc}){dir_note}{inner_note}{instr_note}")
 
     lines = [f"{name.upper()} COMPONENT MAPPING GUIDE - Use these aggressively:"]
     lines.extend(component_lines)
@@ -196,6 +198,20 @@ def build_ds_enforcement_system_prompt(
 
     prefix_note = f"- NEVER invent child tags like <{ds_prefix}-item>, <{ds_prefix}-option> (unless listed above)\n" if ds_prefix else ""
 
+    # Collect per-component special instructions
+    instr_lines = []
+    for c in components:
+        cg_instr = c.get("code_gen_instructions", "")
+        if cg_instr:
+            instr_lines.append(f"  - **{c['selector']}**: {cg_instr}")
+    component_instructions_section = ""
+    if instr_lines:
+        component_instructions_section = (
+            "\n### Component-specific instructions (follow exactly):\n"
+            + "\n".join(instr_lines)
+            + "\n"
+        )
+
     return f"""## DESIGN SYSTEM ENFORCEMENT RULES (Mandatory)
 
 You are working with the {ds_name} design system. The following rules are NON-NEGOTIABLE:
@@ -215,7 +231,7 @@ You are working with the {ds_name} design system. The following rules are NON-NE
 - Write ONLY layout-level properties: flex, grid, padding, gap, margin, background-color, border, box-shadow
 - Typography → use utility classes or leave to DS default styles
 - Pixel overrides ONLY when no DS utility class exists
-{intent_rule}"""
+{component_instructions_section}{intent_rule}"""
 
 
 def build_catalog_import_example(catalog: Dict) -> str:
@@ -430,6 +446,10 @@ def _resolve_ambiguous_with_llm(
             styling = ir_node.get("styling")
             return styling if isinstance(styling, dict) else {}
 
+        def _safe_properties(ir_node):
+            props = ir_node.get("properties")
+            return props if isinstance(props, dict) else {}
+
         nodes_payload = [
             {
                 "id":          item["ir_node"].get("id"),
@@ -442,7 +462,7 @@ def _resolve_ambiguous_with_llm(
                     for c in item["ir_node"].get("children", [])[:8]
                     if isinstance(c, dict)
                 ],
-                "inner_text":  (item["ir_node"].get("properties") or {}).get("innerText", "")[:100],
+                "inner_text":  _safe_properties(item["ir_node"]).get("innerText", "")[:100],
                 "has_shadow":  bool(_safe_styling(item["ir_node"]).get("effects")),
                 "has_fill":    bool(_safe_styling(item["ir_node"]).get("fills")),
                 "candidates": [
@@ -501,15 +521,22 @@ Output ONLY valid JSON array, no markdown fences or explanation."""
         print(f"Warning: Ambiguous node LLM resolution failed: {exc}")
 
     # Fallback: native HTML for all ambiguous nodes
-    return [
-        {
-            "figma_node_id": item["ir_node"].get("id", ""),
+    fallback = []
+    for item in ambiguous_nodes:
+        ir_node = item.get("ir_node") if isinstance(item, dict) else None
+        if isinstance(ir_node, dict):
+            node_id = ir_node.get("id", "")
+            html_tag = _infer_native_html_tag(ir_node)
+        else:
+            node_id = ""
+            html_tag = "div"
+        fallback.append({
+            "figma_node_id": node_id,
             "ds_component": "native",
-            "ds_selector": _infer_native_html_tag(item["ir_node"]),
+            "ds_selector": html_tag,
             "inputs": {},
-        }
-        for item in ambiguous_nodes
-    ]
+        })
+    return fallback
 
 
 def _resolve_uncertain_nodes_parallel(
@@ -535,20 +562,31 @@ def _resolve_uncertain_nodes_parallel(
 
     results_by_idx: Dict[int, List[Dict]] = {}
 
+    def _safe_fallback_for_batch(batch: List[Dict]) -> List[Dict]:
+        """Build native-HTML fallback mappings, tolerant of malformed ir_node data."""
+        result = []
+        for item in batch:
+            ir_node = item.get("ir_node") if isinstance(item, dict) else None
+            if isinstance(ir_node, dict):
+                node_id = ir_node.get("id", "")
+                html_tag = _infer_native_html_tag(ir_node)
+            else:
+                node_id = ""
+                html_tag = "div"
+            result.append({
+                "figma_node_id": node_id,
+                "ds_component": "native",
+                "ds_selector": html_tag,
+                "inputs": {},
+            })
+        return result
+
     def process_batch(idx: int, batch: List[Dict]) -> tuple:
         try:
             return idx, _resolve_ambiguous_with_llm(batch, catalog_entries, prompt_hints)
         except Exception as exc:
             print(f"  Warning: sub-batch {idx+1} failed ({exc}), using native fallback")
-            return idx, [
-                {
-                    "figma_node_id": item["ir_node"].get("id", ""),
-                    "ds_component": "native",
-                    "ds_selector": _infer_native_html_tag(item["ir_node"]),
-                    "inputs": {},
-                }
-                for item in batch
-            ]
+            return idx, _safe_fallback_for_batch(batch)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
@@ -1515,12 +1553,12 @@ def _extract_ir_nodes(data: Any) -> List[Dict]:
       - A dict with no recognisable key → treat the dict as a single node
     """
     if isinstance(data, list):
-        return data
+        return [item for item in data if isinstance(item, dict)]
     if isinstance(data, dict):
         for key in ("nodes", "ir_tree", "tree", "components", "result", "data", "children"):
             val = data.get(key)
             if isinstance(val, list) and val:
-                return val
+                return [item for item in val if isinstance(item, dict)]
         # Single-node dict — wrap it
         return [data]
     return []
@@ -2243,10 +2281,11 @@ def _build_component_hierarchy_context(ir_tree: List[Dict], mappings: List,
             "properties": ir_node.get("properties", {}),
             "styling": ir_node.get("styling", {}),
         }
-        # Resolve HTML classes, directives, and inner_html_note from catalog
+        # Resolve HTML classes, directives, inner_html_note, and code_gen_instructions from catalog
         resolved_classes: List[str] = []
         resolved_directives: List[str] = []
         inner_html_note: str = ""
+        code_gen_instructions: str = ""
 
         ds_comp = mapping.get("ds_component", "")
         if ds_comp and ds_comp != "native":
@@ -2269,6 +2308,8 @@ def _build_component_hierarchy_context(ir_tree: List[Dict], mappings: List,
             ]
             # Inner HTML guidance from catalog
             inner_html_note = cat_entry.get("inner_html_note", "")
+            # Special code generation instructions from catalog
+            code_gen_instructions = cat_entry.get("code_gen_instructions", "")
             # Inputs from catalog — overrides the empty mapping default
             catalog_inputs = cat_entry.get("inputs", [])
             if catalog_inputs:
@@ -2278,6 +2319,8 @@ def _build_component_hierarchy_context(ir_tree: List[Dict], mappings: List,
         context_node["resolved_directives"] = resolved_directives
         if inner_html_note:
             context_node["inner_html_note"] = inner_html_note
+        if code_gen_instructions:
+            context_node["code_gen_instructions"] = code_gen_instructions
 
         if ir_node.get("children"):
             context_node["children"] = [
@@ -2906,6 +2949,9 @@ GENERATE:
   custom element. Example: <button mtButton class="mt-btn mt-btn-primary">Label</button>
 - If a node has an inner_html_note in component_hierarchy_with_ds_mappings, follow it exactly
   for the component's inner content
+- If a node has code_gen_instructions in component_hierarchy_with_ds_mappings, follow those
+  instructions exactly when generating that component — they describe the correct API usage,
+  required inputs/outputs, structural patterns, or implementation specifics for that component
 
 CRITICAL — TAG RESTRICTIONS (read carefully):
 - The ONLY {ds_name} custom element tags you may use are: {allowed_tags_str}

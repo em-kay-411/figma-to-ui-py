@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy to design_systems/{name}_catalog.json and fill in all fields. Run generate_figma_hints.py to auto-generate figma_hints for components. URLs must be filled manually. Run 'python doc_knowledge_builder.py <ds> --enrich-catalog' to auto-populate import_statement, component_classes, directives, base_classes, variant_class_map, and inner_html_note.",
+  "_comment": "Copy to design_systems/{name}_catalog.json and fill in all fields. Run generate_figma_hints.py to auto-generate figma_hints for components. URLs must be filled manually. Run 'python doc_knowledge_builder.py <ds> --enrich-catalog' to auto-populate import_statement, component_classes, directives, base_classes, variant_class_map, and inner_html_note. Add code_gen_instructions (string) to any component for special implementation notes (API usage, required structure, etc.) — these are injected into code generation, repair, and refine prompts.",
   "name": "MyDesignSystem",
   "framework": "angular",
   "prefix": "mds",
@@ -58,6 +58,7 @@
         "small":     ["mds-btn-sm"]
       },
       "inner_html_note": "Place text label or icon as direct children; no inner DS tags needed.",
+      "code_gen_instructions": "Use [severity] input for variants (primary, secondary, success, danger). Use [icon] input for icon-only buttons. Use [outlined]='true' for outline style.",
       "urls": {
         "overview": "https://docs.example.com/components/button",
         "api":      "https://docs.example.com/components/button#api",
