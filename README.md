@@ -97,27 +97,34 @@ The REST API (`api.py`) wraps the pipeline in a stateful, multi-turn HTTP interf
                              │
                              ▼
 ┌──────────────────────────────────────────────────────────────────────┐
-│                        LANGGRAPH WORKFLOW                             │
+│                     LANGGRAPH WORKFLOW (11 nodes)                     │
 │                                                                       │
-│  ┌──────────────┐  ┌──────────┐  ┌────────────┐  ┌───────────────┐  │
-│  │  1. INGEST   │─▶│ 2. BUILD │─▶│  3. MAP TO │─▶│  4. GENERATE  │  │
-│  │     FIGMA    │  │    IR    │  │     DS     │  │     CODE      │  │
-│  └──────────────┘  └──────────┘  └────────────┘  └──────┬────────┘  │
-│                                                          │            │
-│                                                          ▼            │
-│                                                  ┌────────────┐      │
-│                                                  │ 5. VALIDATE│      │
-│                                                  └──────┬─────┘      │
-│                                                         │             │
-│                                         ┌───────────────┴──────┐     │
-│                                         │    errors?            │     │
-│                                         ▼ yes (≤2 attempts)    │     │
-│                                  ┌────────────┐                │     │
-│                                  │  6. REPAIR │────────────────┘     │
-│                                  └────────────┘  no errors / max     │
-│                                                         │             │
-│                                                         ▼             │
-│                                                       [END]           │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────┐  ┌──────────┐         │
+│  │ 1.INGEST │─▶│ 2.PRUNE  │─▶│ 3.RESOLVE    │─▶│ 4.BUILD  │         │
+│  │   FIGMA  │  │   TREE   │  │ PROMPT INSTR │  │    IR    │         │
+│  └──────────┘  └──────────┘  └──────────────┘  └────┬─────┘         │
+│                                                       │               │
+│                                                       ▼               │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────┐  ┌──────────┐         │
+│  │ 8.FIX    │◀─│ 7.REFINE │◀─│ 6.GENERATE   │◀─│ 5.MAP TO │         │
+│  │ IMPORTS  │  │ TYPOGR.  │  │    CODE      │  │    DS    │         │
+│  └────┬─────┘  └──────────┘  └──────────────┘  └──────────┘         │
+│       │                                                               │
+│       ▼                                                               │
+│  ┌──────────┐  ┌──────────────┐                                      │
+│  │ 9.VALID- │─▶│10.DEEP VALID │                                      │
+│  │   ATE    │  │   DS USAGE   │                                      │
+│  └──────────┘  └──────┬───────┘                                      │
+│                        │                                              │
+│            ┌───────────┴──────┐                                      │
+│            │    errors?        │                                      │
+│            ▼ yes (≤2 attempts) │                                      │
+│     ┌────────────┐             │                                      │
+│     │ 11. REPAIR │─────────────┘                                      │
+│     └────────────┘  no errors / max                                   │
+│                        │                                              │
+│                        ▼                                              │
+│                      [END]                                            │
 └──────────────────────────────────────────────────────────────────────┘
                              │
                              ▼
@@ -310,7 +317,7 @@ Steps 1–4 only need to be re-run when the design system changes or new compone
 
 ## Pipeline Deep Dive
 
-The pipeline is a **LangGraph `StateGraph`** with six nodes sharing a single `AgentState` TypedDict. Each node receives the full state, mutates it in place, and returns it.
+The pipeline is a **LangGraph `StateGraph`** with eleven nodes sharing a single `AgentState` TypedDict. Each node receives the full state, mutates it in place, and returns it.
 
 ```
 AgentState fields
@@ -332,6 +339,13 @@ messages                list       LLM message history
 phase1_research_context str|None   Phase 1 output — persisted to session
                                    so refine turns can reuse it without
                                    re-running Phase 1
+user_prompt             str|None   Original user prompt (if provided);
+                                   used by resolve_prompt_instructions and
+                                   scoring (+50 prompt boost)
+prompt_research_context str|None   Output of resolve_prompt_instructions
+                                   node — prompt-derived component hints
+prompt_component_hints  list|None  Component names/selectors extracted
+                                   from the user prompt; fed into scoring
 ```
 
 ---
@@ -433,7 +447,7 @@ avatar      form-field expansion-panel  sidenav   unknown
 
 Maps every IR node to a DS component selector or native HTML tag using a multi-tier scoring system.
 
-**Six-signal scoring (`_score_catalog_match`):**
+**Seven-signal scoring (`_score_catalog_match`):**
 
 ```
 Signal                                          Points
@@ -444,9 +458,12 @@ IR semantic type matches catalog entry name     +25
 Figma node type in entry's figma_node_types     +15
 Node is a Figma INSTANCE node                    +5
 Any child's name contains a catalog hint        +15
+User prompt mentions selector/name (prompt boost) +50
 ──────────────────────────────────────────────────────
 Maximum score (capped)                          100
 ```
+
+The **prompt boost** is awarded when the user supplies a text prompt and a catalog entry's `selector` or `name` appears in `prompt_component_hints` extracted from that prompt. This ensures that explicitly requested components rank near the top even if Figma layer names are ambiguous.
 
 **Text node classification (deterministic, no LLM):**
 
@@ -468,15 +485,16 @@ Score ≥ 70  →  Tier 1: definite match (deterministic)
                Best entry used immediately; API URL primed in cache
 
 30 ≤ score < 70  →  Tier 2: ambiguous
-                    Collected for a single batch LLM call
-                    (_resolve_ambiguous_with_llm)
-
-1 ≤ score < 30  →  Tier 3: low confidence
-                   Per-node LLM call with full subtree context
-                   (_resolve_low_confidence_nodes)
+                    ┐
+                    │  Both tiers merged into
+1 ≤ score < 30  →  Tier 3: low confidence   │  _resolve_uncertain_nodes_parallel()
+                    ┘  Parallel batched LLM calls via ThreadPoolExecutor
+                       (TIER23_BATCH_SIZE nodes/batch, max 8 workers)
 
 score == 0  →  native HTML fallback (div, section, etc.)
 ```
+
+Tier 2 and Tier 3 nodes are collected together and resolved by `_resolve_uncertain_nodes_parallel()`, which splits them into batches of `TIER23_BATCH_SIZE` nodes and dispatches each batch to a parallel LLM call. This replaced the old per-node Tier 3 resolution (`_resolve_low_confidence_nodes`) and the separate Tier 2 batch call.
 
 **Output — `DSComponentMapping` per node:**
 ```python
@@ -610,13 +628,14 @@ back to validate_node
 
 ## Component Hierarchy Context
 
-`_build_component_hierarchy_context()` annotates every IR node with four fields resolved from the catalog before the code-gen LLM is called:
+`_build_component_hierarchy_context()` annotates every IR node with five fields resolved from the catalog before the code-gen LLM is called:
 
 | Field | Type | Source | Description |
 |---|---|---|---|
 | `resolved_classes` | `List[str]` | Catalog `base_classes` + variant matching | CSS classes to apply unconditionally + variant classes |
 | `resolved_directives` | `List[str]` | Catalog `directives[].selector` | Angular attribute directives to emit as bare attributes |
 | `inner_html_note` | `str` (optional) | Catalog `inner_html_note` | One-sentence guide on valid inner content for this element |
+| `code_gen_instructions` | `str` (optional) | Catalog `code_gen_instructions` | Per-component implementation notes (API usage, required structure, etc.) |
 | `ds_component` / `ds_selector` | `str` | Stage 3 mapping | Component name and HTML tag |
 
 **Example context node for a primary button:**
@@ -631,11 +650,12 @@ back to validate_node
   "resolved_classes": ["mt-btn", "mt-btn-primary", "mt-btn-lg"],
   "resolved_directives": ["mtButton"],
   "inner_html_note": "Place text label as direct child; no inner DS tags.",
+  "code_gen_instructions": "Always use the [label] input for button text; do not place text as a child node.",
   "inputs": {}
 }
 ```
 
-The code-gen LLM is instructed to treat `resolved_classes` and `resolved_directives` as **authoritative** — use them exactly, do not guess or add extra classes.
+The code-gen LLM is instructed to treat `resolved_classes` and `resolved_directives` as **authoritative** — use them exactly, do not guess or add extra classes. When `code_gen_instructions` is present, the LLM must follow those instructions exactly.
 
 **Directive-based components:** When `ds_selector` is a native HTML element (`button`, `input`, etc.) and `resolved_directives` is non-empty, the LLM generates the native tag with directives as bare attributes:
 
@@ -747,7 +767,7 @@ The system prompt also states:
 
 > For components that manage their own inner content (selects, dropdowns, segmented controls, autocompletes, tab groups): pass items/options as `@Input()` arrays or objects — do NOT add inner component tags. Close the tag with no children, or use only native HTML inside if `inner_html_note` explicitly says to.
 
-### `inner_html_note` per node
+### `inner_html_note` and `code_gen_instructions` per node
 
 When a catalog entry has `inner_html_note`, it is included in the component hierarchy context for that node and the LLM is instructed to follow it exactly:
 
@@ -755,6 +775,15 @@ When a catalog entry has `inner_html_note`, it is included in the component hier
 {
   "ds_component": "select",
   "inner_html_note": "Pass options via [options] input (array); no inner option tags."
+}
+```
+
+When a catalog entry has `code_gen_instructions`, those instructions are also attached to the node in the hierarchy context, included in the mapping guide (as `| INSTRUCTIONS: ...`), and added to the DS enforcement prompt under a `### Component-specific instructions` section. The LLM is told: "If a node has code_gen_instructions, follow those instructions exactly."
+
+```json
+{
+  "ds_component": "table",
+  "code_gen_instructions": "Use [value] for data binding and <ng-template pTemplate=\"header\"> / <ng-template pTemplate=\"body\"> for column definitions."
 }
 ```
 
@@ -850,7 +879,12 @@ File: `design_systems/{name}_catalog.json`
 
       // One-sentence description of valid inner HTML content
       // The LLM follows this exactly — critical for preventing hallucinated child tags
-      "inner_html_note": "Place text label or icon as direct children; no inner DS tags needed."
+      "inner_html_note": "Place text label or icon as direct children; no inner DS tags needed.",
+
+      // (Optional) Per-component implementation instructions — API usage, required
+      // structure, gotchas. Flows into hierarchy context, codegen prompt, and
+      // enforcement prompt. The LLM follows these instructions exactly.
+      "code_gen_instructions": "Always use the [label] input for button text; do not place text content as a child element."
     },
 
     // Example: component that uses @Input() instead of CSS classes for variants
@@ -1288,7 +1322,7 @@ curl -X DELETE http://localhost:8000/sessions/f3a1bc92-4d2e-4a7c-9f8e-1234abcd56
 
 #### `POST /sessions/{session_id}/generate`
 
-**Purpose:** Run the full 6-stage LangGraph pipeline to produce Angular component files. Accepts any combination of a Figma JSON export, a screenshot, and a text prompt — at least one is required.
+**Purpose:** Run the full 11-node LangGraph pipeline to produce Angular component files. Accepts any combination of a Figma JSON export, a screenshot, and a text prompt — at least one is required.
 
 The request is `multipart/form-data` (required because file uploads are mixed with text fields).
 
@@ -1422,20 +1456,24 @@ curl -X POST http://localhost:8000/sessions/SESSION_ID/generate \
    └─ run_figma_to_angular(figma_json, figma_screenshots, design_system)
         ├─ load_ds_catalog(design_system) → reads _catalog.json from disk
         ├─ Populates DS_CATALOG, DS_CATALOG_ENTRY_MAP, DOC_KNOWLEDGE globals
-        ├─ Builds LangGraph workflow (6 nodes)
+        ├─ Builds LangGraph workflow (11 nodes)
         ├─ workflow.invoke(initial_state)
-        │    Stage 1: ingest_figma_node   — clean + normalise tree
-        │    Stage 2: prune_figma_tree_node — drop spacers, collapse wrappers
-        │    Stage 3: build_ir_node        — LLM: semantic IR types
-        │    Stage 4: map_to_ds_node       — score + LLM: DS selectors
-        │    Stage 5: generate_angular_code_node
+        │    Node 1:  ingest_figma_node          — clean + normalise tree
+        │    Node 2:  prune_figma_tree_node      — drop spacers, collapse wrappers
+        │    Node 3:  resolve_prompt_instructions — tool-calling LLM extracts
+        │               component hints from user prompt (when prompt provided)
+        │    Node 4:  build_ir_node              — LLM: semantic IR types
+        │    Node 5:  map_to_ds_node             — score + LLM: DS selectors
+        │    Node 6:  generate_angular_code_node
         │               Phase 1: tool-calling loop (fetch component docs)
         │               → stores result in state["phase1_research_context"]
         │               Phase 2: structured LLM call → GeneratedAngularArtifact
-        │    Stage 6: refine_typography_node — optional SCSS cleanup
-        │    Stage 7: fix_imports_node      — ensure TS imports are correct
-        │    Stage 8: validate_node         — DS usage ratio check
-        │    Stage 9: repair_node (conditional, max 2×)
+        │    Node 7:  refine_typography_node     — LLM SCSS cleanup
+        │    Node 8:  fix_imports_node           — LLM ensures TS imports correct
+        │    Node 9:  validate_node              — heuristic DS usage ratio check
+        │    Node 10: deep_validate_ds_usage_node — tool-calling LLM checks
+        │               base_class, variant_class, directive, import, inner_html
+        │    Node 11: repair_node (conditional, max 2×)
         └─ Returns (artifact, final_state)
 
 6. compute_ds_coverage(artifact, design_system, catalog)
@@ -2123,12 +2161,16 @@ Cache entries are permanent until manually deleted. Delete `*.txt` files in `cac
 |---|---|---|---|
 | Prompt→HTML synthesis | gpt-4o | No (JSON parsed) | When `figma_json` absent (prompt/screenshot path) |
 | HTML→Figma tree synthesis | gpt-4o | No (JSON parsed) | When `figma_json` absent (prompt/screenshot path) |
+| Resolve prompt instructions | gpt-4o | Via tools | When user prompt is provided (tool-calling LLM extracts component hints) |
 | IR generation | gpt-4o | No (JSON parsed manually) | Always |
-| Ambiguous node resolution (batch) | gpt-4o | No | If ambiguous nodes exist (30 ≤ score < 70) |
-| Low-confidence node resolution (per-node) | gpt-4o | No | If score 1–29 nodes exist |
+| Tier 2+3 uncertain node resolution (parallel batches) | gpt-4o | No | If nodes with score 1–69 exist (merged Tier 2+3) |
 | Phase 1 — tool-calling loop | gpt-4o | Via tools | If DOC_KNOWLEDGE or DS components mapped |
 | Screenshot analysis | gpt-4o vision | No | If screenshot provided |
 | Code generation | gpt-4o | Yes (Pydantic) | Always |
+| Refine typography | gpt-4o | Yes (Pydantic) | Always (SCSS cleanup pass) |
+| Fix imports | gpt-4o | Yes (Pydantic) | Always (ensures TS imports are correct) |
+| Validate | — | — | Always (heuristic, no LLM) |
+| Deep validate DS usage | gpt-4o | Via tools | Always (tool-calling LLM checks class/directive/import/inner-HTML correctness) |
 | Repair | gpt-4o | Yes (Pydantic) | If validation fails, max 2× |
 
 ### Refine pipeline (DS-aware)
@@ -2147,7 +2189,7 @@ Cache entries are permanent until manually deleted. Delete `*.txt` files in `cac
 | `doc_knowledge_builder.py` — class extraction | gpt-4o | No | One-time per DS |
 | `doc_knowledge_builder.py` — `--enrich-catalog` | gpt-4o | No | One-time per catalog update |
 
-**Typical generate cost (no repair, warm cache):** 2–3 LLM calls (IR + Phase 1 tool loop + code generation).
+**Typical generate cost (no repair, warm cache):** 5–7 LLM calls (resolve prompt instructions + IR + Phase 1 tool loop + code generation + refine typography + fix imports + deep validate DS).
 
 **Typical refine cost (warm doc cache, heuristic intent match):** 1 LLM call (refine code generation). Intent regex matches avoid the classification LLM call. Catalog docs are served from `session.doc_research_cache` or `design_systems/cache/` — no new fetches after the first refine for a given component.
 
@@ -2200,6 +2242,12 @@ Phase 1 output (utility classes, component APIs) is stored in the session as `ph
 ### 15. Conversation routing before LLM invocation
 `route_chat_message()` in `api.py` performs out-of-scope detection (regex, zero LLM cost) and ambiguity detection (intent classification) before the refine LLM is called. Out-of-scope requests (routing, NgModule, backend services) are deflected with a plain text response; ambiguous requests receive a clarification question. The LLM is only invoked for requests that are clearly actionable UI changes.
 
+### 16. Per-component implementation instructions (`code_gen_instructions`)
+Some DS components have non-obvious API usage patterns (e.g. PrimeNG Table requires `<ng-template pTemplate>` for columns, not `<th>` tags). The `code_gen_instructions` catalog field carries these notes through the full pipeline: hierarchy context, mapping guide, code-gen system prompt, and DS enforcement prompt. This prevents the LLM from guessing at component structure when official documentation describes a specific pattern.
+
+### 17. Deep DS validation with tool-calling LLM
+`deep_validate_ds_usage_node` uses a tool-calling LLM (with tools: `get_catalog_entry`, `validate_utility_class`, `fetch_component_docs`, `fetch_doc_page`) to verify that every DS component in the generated HTML uses correct base classes, variant classes, directives, imports, and inner HTML structure. This catches subtle DS-compliance issues that heuristic validation misses.
+
 ---
 
 ## Adding a New Design System
@@ -2247,6 +2295,7 @@ After a few runs, manually tune:
 - `figma_hints` for components that aren't being matched correctly
 - `variant_class_map` keys for components whose CSS classes aren't resolving
 - `inner_html_note` for any component that keeps getting hallucinated child tags
+- `code_gen_instructions` for components that have special API usage patterns (e.g. template-driven components that require `<ng-template>` blocks, components that must use `@Input()` arrays instead of child elements, or components with mandatory structural wrappers)
 
 ---
 

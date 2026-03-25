@@ -100,7 +100,8 @@ like `<p-button>` from native HTML elements like `<button>`.
   "directives":        [],
   "inner_html_note":   "Pass options via [options] input; no inner option tags.",
   "import_statement":  "import { DropdownModule } from 'primeng/dropdown';",
-  "component_classes": ["DropdownModule"]
+  "component_classes": ["DropdownModule"],
+  "code_gen_instructions": "Always bind [options] to a TS array property. Use [optionLabel] to control display text. Never use <option> child elements."
 }
 ```
 
@@ -110,6 +111,12 @@ The critical fields are:
 - `base_classes` + `variant_class_map` — CSS classes applied based on Figma variant data
 - `inner_html_note` — one-sentence rule telling the LLM what is valid inner content
 - `import_statement` + `component_classes` — copied directly into the `.ts` file
+- `code_gen_instructions` — per-component special implementation instructions (API usage patterns,
+  required structure, gotchas). This string flows into the component hierarchy context for each
+  node, the component mapping guide (`| INSTRUCTIONS: ...`), and the DS enforcement prompt
+  (`### Component-specific instructions` section). The code generation, repair, and refine LLMs
+  all see it. Example: `"Always bind [options] to a TS array property. Use [optionLabel] to
+  control display text. Never use <option> child elements."`
 
 Three fields are auto-populated by the one-time setup scripts. Let me show those quickly."
 
@@ -221,14 +228,14 @@ The pipeline reads it directly."
 multi-step LLM workflows as directed graphs. Each node in the graph is a Python function.
 All nodes share a single `AgentState` TypedDict — they read from it, mutate it, and return it.
 
-The workflow has **nine nodes**:
+The workflow has **eleven nodes**:
 
 ```
 ingest_figma
     ↓
 prune_figma_tree
     ↓
-resolve_prompt_instructions   ← NEW: tool-calling research for user prompt
+resolve_prompt_instructions   ← tool-calling research for user prompt
     ↓
 build_ir
     ↓
@@ -240,9 +247,13 @@ refine_typography
     ↓
 fix_imports
     ↓
-validate ─── errors? ──▶ repair ──┐
-    │                              │
-    └── no errors / max attempts ◀─┘
+validate
+    ↓
+deep_validate_ds              ← LLM tool-calling loop for DS correctness
+    ↓
+    └─── errors? ──▶ repair ──┐
+    │                          │
+    └── no errors / max 2x  ◀─┘
     ↓
    END
 ```
@@ -532,7 +543,7 @@ so that subsequent **refine** turns can reuse it without running Phase 1 again.
 ### Sub-phase B — Component Hierarchy Context
 
 Before calling the code generation LLM, `_build_component_hierarchy_context()` annotates
-every IR node with four pre-computed fields from the catalog:
+every IR node with pre-computed fields from the catalog:
 
 ```json
 {
@@ -542,9 +553,17 @@ every IR node with four pre-computed fields from the catalog:
   "ds_selector": "p-button",
   "resolved_classes":    ["p-button", "p-button-primary"],
   "resolved_directives": [],
-  "inner_html_note": "Use [label] input for button text; no inner tags."
+  "inner_html_note": "Use [label] input for button text; no inner tags.",
+  "code_gen_instructions": "Always use [label] input for text. Never place text inside the element."
 }
 ```
+
+`code_gen_instructions` is pulled from the catalog entry for the matched component and attached
+directly to each node in the context JSON. The code generation system prompt includes the rule:
+*"If a node has code_gen_instructions, follow those instructions exactly."* The same instructions
+are also included in `build_catalog_code_gen_prompt()` as `| INSTRUCTIONS: ...` in the component
+mapping guide, and in `build_ds_enforcement_system_prompt()` under a dedicated
+`### Component-specific instructions` section — so repair and refine LLMs also see them.
 
 `resolved_classes` comes from the variant resolution system — let me explain that briefly.
 
@@ -614,11 +633,14 @@ no regex parsing, no error-prone JSON extraction."
 
 ---
 
-## SECTION 11 — Stages 5 & 6: Validate and Repair
+## SECTION 11 — Stages 5, 5b & 6: Validate, Deep Validate DS, and Repair
 
-> **[Validate: no LLM. Repair: 1 structured-output LLM call. Conditional.]**
+### Stage 5a: Validate (`validate_node`)
 
-"After code generation, `validate_node` runs a set of heuristic checks with no LLM involved:
+> **[No LLM — heuristic checks]**
+
+"After code generation (and the `refine_typography` + `fix_imports` post-processing nodes),
+`validate_node` runs a set of heuristic checks with no LLM involved:
 
 1. The artifact exists and has at least one file.
 2. Every DS component selector in `ds_components_used` is either in the catalog or is a
@@ -626,13 +648,63 @@ no regex parsing, no error-prone JSON extraction."
 3. DS usage ratio: if the template has more than 5 mappable elements but fewer than 2
    DS component uses, a `low_ds_usage` error is raised.
 
-If errors are found and `repair_attempt < 2`, the `should_repair()` function routes to
-the `repair_node`.
+### Stage 5b: Deep Validate DS Usage (`deep_validate_ds_usage_node`)
+
+> **[LLM tool-calling loop — runs after heuristic validation]**
+
+"This is a new stage that performs deep, semantic validation of design system usage.
+Unlike the heuristic validator, it uses an LLM with tool access to inspect the generated
+code against the catalog and documentation.
+
+The LLM has access to five tools:
+
+```
+get_catalog_entry(component_name)
+  Looks up a component in the catalog by name or selector.
+  → Returns: selector, base_classes, variant_class_map, directives,
+             inner_html_note, import_statement, code_gen_instructions
+
+validate_utility_class(class_name)
+  Checks whether a CSS class exists in the utility class knowledge base.
+  → Returns: valid/invalid + description if found
+
+fetch_component_docs(component, doc_type)
+  Fetches API or usage docs for a catalog component via DocScraper.
+  → Returns: up to 8,000 chars of documentation
+
+fetch_doc_page(url)
+  Fetches any arbitrary documentation URL.
+  → Returns: up to 8,000 chars of scraped text
+```
+
+The LLM runs a tool-calling loop and checks five categories of correctness:
+
+1. **base_class** — Are all required `base_classes` from the catalog present on each
+   element using that component?
+2. **variant_class** — Do the `variant_class_map` classes in the HTML match the catalog
+   definitions for the applied variants?
+3. **directive** — Are directive selectors (from the catalog's `directives` array) placed
+   correctly on the right elements?
+4. **import** — Is the `import_statement` from the catalog present in the `.ts` file?
+5. **inner_html** — Does the inner content of each component element match the
+   `inner_html_note` rule?
+
+Each violation is recorded as a structured finding with category, severity, component,
+and a recommended fix. These findings are merged into the validation errors list."
+
+### Stage 6: Repair (`repair_node`)
+
+> **[LLM: 1 structured-output call. Conditional — runs only if errors found.]**
+
+"If errors are found (from either heuristic validation or deep DS validation) and
+`repair_attempt < 2`, the `should_repair()` function routes to the `repair_node`.
 
 The repair node calls the LLM with:
 - A `SystemMessage` containing the full DS enforcement prompt (same shared builder used
-  in codegen — this is Enhancement G from the DS-aware plan)
-- A `HumanMessage` with the error list, all 20 component mappings, and all generated files
+  in codegen — this is Enhancement G from the DS-aware plan), including the
+  `### Component-specific instructions` section with `code_gen_instructions` for every
+  component found in the generated code
+- A `HumanMessage` with the error list, all component mappings, and all generated files
 
 The LLM produces a corrected `GeneratedAngularArtifact` that replaces the current one,
 and the workflow loops back to `validate_node`.
@@ -908,7 +980,7 @@ curl -X POST http://localhost:8000/sessions/$SESSION_ID/generate \
 ```
 
 "The file is read server-side, parsed as JSON, and passed to `generate_angular_component()`.
-The full 9-stage pipeline runs. The response includes the generated files, DS coverage score,
+The full 11-stage pipeline runs. The response includes the generated files, DS coverage score,
 unresolved nodes, and chat history."
 
 ### Step 4 — Generate with prompt instructions
@@ -1023,7 +1095,8 @@ generate_angular_component()         ← unified entry point
                7. refine_typography             [LLM: inline style → utility class]
                8. fix_imports                   [LLM: missing import correction]
                9. validate                      [no LLM]
-              10. repair (conditional, ≤2x)     [LLM: structured output]
+              10. deep_validate_ds              [tool LLM: DS correctness checks]
+              11. repair (conditional, ≤2x)     [LLM: structured output]
 
 Returns: (GeneratedAngularArtifact, final_state)
 
@@ -1041,16 +1114,27 @@ Key properties of this design:
    variant resolution, component hierarchy context — all pure Python, zero LLM.
 
 3. **LLM only for semantic judgement** — IR classification, ambiguous node resolution,
-   documentation research, code generation. Everything else is deterministic.
+   documentation research, code generation, deep DS validation. Everything else is deterministic.
 
 4. **Prompt propagates through the full pipeline** — the user instruction reaches the
    pre-IR research node (tool calling), the IR system prompt, the DS mapping score (Tier 1
    boost + Tier 2/3 preference injection), and the code gen system prompt (highest priority block).
 
 5. **Shared enforcement** — `build_ds_enforcement_system_prompt()` produces the same selector
-   whitelist and SCSS rules for initial generation, refine, and repair. No path can bypass it.
+   whitelist, SCSS rules, and component-specific instructions for initial generation, refine,
+   and repair. No path can bypass it.
 
-6. **Session continuity** — Phase 1 research context, doc research cache, and DS coverage
+6. **Per-component instructions** — The `code_gen_instructions` catalog field lets you attach
+   implementation rules to individual components (API patterns, required structure, gotchas).
+   These flow into the component hierarchy context, the mapping guide, and the enforcement
+   prompt — visible to code generation, repair, and refine LLMs.
+
+7. **Deep validation** — Beyond heuristic checks, the `deep_validate_ds` node uses an LLM
+   tool-calling loop to verify base classes, variant classes, directives, imports, and inner
+   HTML against the catalog and live documentation. This catches semantic errors that pattern
+   matching alone cannot detect.
+
+8. **Session continuity** — Phase 1 research context, doc research cache, and DS coverage
    history persist across multi-turn conversations so later refine calls are fast and coherent."
 
 ---
@@ -1093,6 +1177,27 @@ in the generated HTML using stdlib `html.parser`. 'Mappable' means tags that typ
 have a DS equivalent: button, select, input, textarea, table, a, plus any catalog selector.
 Structural divs and spans are not counted. It's useful for tracking regression across
 refine turns, not as a hard quality gate."
+
+**Q: How do I add special implementation instructions for a specific component?**
+
+"Use the `code_gen_instructions` field in the catalog entry. It's a free-form string where
+you describe API usage patterns, required structure, or common pitfalls for that component.
+For example, for a dropdown you might write:
+
+```json
+\"code_gen_instructions\": \"Always bind [options] to a TS array property. Use [optionLabel] to control display text. Never use <option> child elements.\"
+```
+
+These instructions are surfaced in four places:
+1. The **component hierarchy context** — attached to each IR node mapped to that component
+2. The **component mapping guide** — shown as `| INSTRUCTIONS: ...` in the code gen prompt
+3. The **DS enforcement prompt** — under `### Component-specific instructions`, so repair
+   and refine LLMs also see them
+4. The **code generation system prompt** — with the rule: 'If a node has code_gen_instructions,
+   follow those instructions exactly'
+
+You do not need to re-run any setup scripts after editing this field. The pipeline reads it
+directly from the catalog at runtime."
 
 ---
 
