@@ -18,6 +18,7 @@ from figma_to_angular_agent import (
     generate_from_prompt,
     generate_angular_component,
     refine_with_prompt,
+    build_artifact_from_files,
     classify_refine_intent,
     build_component_suggestion_response,
     query_catalog_for_intent,
@@ -56,6 +57,12 @@ class CreateSessionRequest(BaseModel):
 class RefineRequest(BaseModel):
     prompt: str
     screenshot_base64: Optional[str] = None
+    # Optional: supply existing file contents to refine (bypasses /generate)
+    html_content: Optional[str] = None
+    scss_content: Optional[str] = None
+    ts_content: Optional[str] = None
+    figma_json: Optional[dict] = None
+    component_name: Optional[str] = None
 
 
 # ── Enhancement H: Conversation Router ────────────────────────────────────────
@@ -149,16 +156,40 @@ def generate(
     figma_json: Optional[UploadFile] = File(None),
     screenshot: Optional[UploadFile] = File(None),
     prompt: Optional[str] = Form(None),
+    html_content: Optional[str] = Form(None),
+    scss_content: Optional[str] = Form(None),
+    ts_content: Optional[str] = Form(None),
+    component_name: Optional[str] = Form(None),
 ):
     s = _get_or_404(session_id)
-    if not figma_json and not screenshot and not prompt:
+    has_files = any([html_content, scss_content, ts_content])
+    if not figma_json and not screenshot and not prompt and not has_files:
         raise HTTPException(
-            400, "Provide at least one of figma_json, screenshot, or prompt"
+            400,
+            "Provide at least one of figma_json, screenshot, prompt, "
+            "or existing file contents (html_content / scss_content / ts_content)",
         )
 
     figma_data = None
     if figma_json:
         figma_data = json.loads(figma_json.file.read())
+
+    # Build existing_files dict when user supplies file contents
+    existing_files = None
+    if has_files:
+        existing_files = {}
+        if html_content:
+            existing_files["html"] = html_content
+        if ts_content:
+            existing_files["typescript"] = ts_content
+        if scss_content:
+            existing_files["scss"] = scss_content
+
+    # Merge component_name into prompt so codegen picks it up
+    effective_prompt = prompt
+    if component_name:
+        name_hint = f"The component must be named '{component_name}'."
+        effective_prompt = f"{name_hint}\n{prompt}" if prompt else name_hint
 
     screenshot_path = _save_upload_to_tempfile(screenshot) if screenshot else None
     try:
@@ -167,7 +198,8 @@ def generate(
             design_system=s.design_system,
             figma_json=figma_data,
             screenshot_path=screenshot_path,
-            prompt=prompt,
+            prompt=effective_prompt,
+            existing_files=existing_files,
         )
     except Exception as e:
         raise HTTPException(500, str(e))
@@ -231,9 +263,22 @@ def generate(
 @app.post("/sessions/{session_id}/refine")
 def refine(session_id: str, body: RefineRequest):
     s = _get_or_404(session_id)
+
+    # If user supplies file contents, build an artifact from them
+    has_external_files = any([body.html_content, body.scss_content, body.ts_content])
+    if has_external_files:
+        s.current_artifact = build_artifact_from_files(
+            html_content=body.html_content,
+            scss_content=body.scss_content,
+            ts_content=body.ts_content,
+            component_name=body.component_name,
+        )
+
     if not s.current_artifact:
         raise HTTPException(
-            400, "No generated code in session — call /generate first"
+            400,
+            "No code to refine — either call /generate first or supply "
+            "html_content / scss_content / ts_content in the request",
         )
 
     catalog = load_ds_catalog(s.design_system)
@@ -291,6 +336,7 @@ def refine(session_id: str, body: RefineRequest):
             intent=intent,
             doc_research_cache=s.doc_research_cache,
             phase1_research_context=s.phase1_research_context,
+            figma_json=body.figma_json,
         )
     except Exception as e:
         raise HTTPException(500, str(e))

@@ -944,6 +944,7 @@ class AgentState(TypedDict):
     user_prompt: Optional[str]               # Optional user instruction carried through the full pipeline
     prompt_research_context: Optional[str]   # Rich research output from resolve_prompt_instructions node
     prompt_component_hints: Optional[List[str]]  # Catalog selectors/names explicitly requested by user
+    existing_files: Optional[Dict[str, str]] # User-supplied files to refine: {"html": ..., "typescript": ..., "scss": ...}
 
 
 # ============================================================================
@@ -2873,6 +2874,25 @@ all default heuristics. Treat any component or style preferences stated here as 
 
 """
 
+    # Build existing files reference section (when user supplies files to modify)
+    existing_files = state.get("existing_files")
+    existing_files_section = ""
+    if existing_files:
+        parts = [
+            "\n## EXISTING COMPONENT CODE (MODIFY — DO NOT REWRITE FROM SCRATCH)",
+            "The user has supplied existing Angular component files. Use these as the starting point.",
+            "Apply the design structure mappings and user instructions to MODIFY these files.",
+            "Preserve existing logic, structure, and patterns that are not affected by the requested changes.",
+            "Migrate native HTML elements to DS components where the DS mapping indicates a match.\n",
+        ]
+        if existing_files.get("html"):
+            parts.append(f"### Current HTML:\n```html\n{existing_files['html']}\n```\n")
+        if existing_files.get("typescript"):
+            parts.append(f"### Current TypeScript:\n```typescript\n{existing_files['typescript']}\n```\n")
+        if existing_files.get("scss"):
+            parts.append(f"### Current SCSS:\n```scss\n{existing_files['scss']}\n```\n")
+        existing_files_section = "\n".join(parts)
+
     # Build research context section for the prompt (Phase 1 output)
     utility_classes_section = ""
     if utility_classes_context:
@@ -2930,6 +2950,7 @@ CRITICAL TEXT RULES:
 {code_gen_mappings_section}
 {utility_classes_section}
 {user_instructions_section}
+{existing_files_section}
 GENERATE:
 
 1. TypeScript Component (standalone):
@@ -3844,21 +3865,51 @@ def generate_angular_component(
     prompt: Optional[str] = None,
     design_tokens: Optional[Dict] = None,
     fast_mode: bool = False,
+    existing_files: Optional[Dict[str, str]] = None,
 ) -> "tuple[GeneratedAngularArtifact, dict]":
     """Unified entry point for all generate paths.
 
-    Accepts any combination of figma_json, screenshot_path, and prompt.
+    Accepts any combination of figma_json, screenshot_path, prompt, and existing_files.
+    When existing_files is provided, the pipeline uses those files as the starting
+    point and modifies them according to the prompt/screenshot/figma design.
+
     Returns (artifact, pipeline_metadata) where pipeline_metadata contains
     phase1_research_context, ds_coverage, and other state for session persistence.
     """
-    if not figma_json and not screenshot_path and not prompt:
-        raise ValueError("At least one of figma_json, screenshot_path, or prompt is required")
+    has_files = existing_files and any(existing_files.values())
+    if not figma_json and not screenshot_path and not prompt and not has_files:
+        raise ValueError(
+            "At least one of figma_json, screenshot_path, prompt, or existing_files is required"
+        )
 
+    # When user supplies files but no Figma JSON, convert their HTML to a
+    # synthetic Figma tree so the pipeline can run IR → DS mapping on it.
     if figma_json is None:
-        print("Generating HTML from input...")
-        html, css = generate_html_from_input(prompt=prompt, screenshot_path=screenshot_path)
-        print("Converting HTML to synthetic Figma tree...")
-        figma_json = html_to_figma_tree(html, css, name=prompt or "Generated Design")
+        if has_files and existing_files.get("html"):
+            print("Converting existing HTML to synthetic Figma tree...")
+            html = existing_files["html"]
+            css = existing_files.get("scss", "")
+            figma_json = html_to_figma_tree(
+                html, css,
+                name=prompt or "Existing Component",
+            )
+        elif prompt or screenshot_path:
+            print("Generating HTML from input...")
+            html, css = generate_html_from_input(prompt=prompt, screenshot_path=screenshot_path)
+            print("Converting HTML to synthetic Figma tree...")
+            figma_json = html_to_figma_tree(html, css, name=prompt or "Generated Design")
+        else:
+            # Files provided but no HTML — build a minimal Figma tree placeholder
+            figma_json = {
+                "name": "Existing Component",
+                "document": {
+                    "id": "0", "name": "Document", "type": "DOCUMENT",
+                    "children": [{"id": "1", "name": "Page 1", "type": "PAGE", "children": [
+                        {"id": "2", "name": "Root", "type": "FRAME", "children": [], "styling": {}}
+                    ]}],
+                },
+                "components": {}, "styles": {}, "schemaVersion": 0,
+            }
 
     figma_screenshots = {"main": screenshot_path} if screenshot_path else None
 
@@ -3869,6 +3920,7 @@ def generate_angular_component(
         design_system=design_system,
         fast_mode=fast_mode,
         user_prompt=prompt,
+        existing_files=existing_files if has_files else None,
     )
 
     catalog = load_ds_catalog(design_system)
@@ -4188,6 +4240,58 @@ def build_component_suggestion_response(
 
 
 # ============================================================================
+# BUILD ARTIFACT FROM RAW FILES
+# ============================================================================
+
+def build_artifact_from_files(
+    html_content: Optional[str] = None,
+    scss_content: Optional[str] = None,
+    ts_content: Optional[str] = None,
+    component_name: Optional[str] = None,
+) -> "GeneratedAngularArtifact":
+    """Construct a GeneratedAngularArtifact from user-supplied file contents.
+
+    At least one of html_content, scss_content, or ts_content must be provided.
+    If component_name is not given, it is inferred from the TS class name or
+    defaults to 'CustomComponent'.
+    """
+    if not any([html_content, scss_content, ts_content]):
+        raise ValueError("At least one file content (html, scss, or ts) must be provided")
+
+    # Infer component_name from TS class declaration if not provided
+    if not component_name and ts_content:
+        import re as _re
+        m = _re.search(r"export\s+class\s+(\w+)", ts_content)
+        if m:
+            component_name = m.group(1)
+    if not component_name:
+        component_name = "CustomComponent"
+
+    # Derive kebab-case prefix for file paths
+    import re as _re
+    kebab = _re.sub(r"(?<=[a-z0-9])([A-Z])", r"-\1", component_name)
+    kebab = _re.sub(r"(Component|Module)$", "", kebab).strip("-").lower()
+    if not kebab:
+        kebab = "custom-component"
+
+    files: List[GeneratedFile] = []
+    if html_content is not None:
+        files.append(GeneratedFile(path=f"{kebab}.component.html", content=html_content, file_type="html"))
+    if ts_content is not None:
+        files.append(GeneratedFile(path=f"{kebab}.component.ts", content=ts_content, file_type="typescript"))
+    if scss_content is not None:
+        files.append(GeneratedFile(path=f"{kebab}.component.scss", content=scss_content, file_type="scss"))
+
+    return GeneratedAngularArtifact(
+        component_name=component_name,
+        files=files,
+        ds_components_used=[],
+        imports=[],
+        unresolved_nodes=[],
+    )
+
+
+# ============================================================================
 # REFINE WITH PROMPT (DS-aware, Enhancement A/B/C/D)
 # ============================================================================
 
@@ -4200,6 +4304,7 @@ def refine_with_prompt(
     intent: Optional[IntentClassification] = None,
     doc_research_cache: Optional[Dict[str, str]] = None,
     phase1_research_context: Optional[str] = None,
+    figma_json: Optional[Dict[str, Any]] = None,
 ) -> "tuple[GeneratedAngularArtifact, dict]":
     """Apply a natural-language change to existing generated Angular files.
 
@@ -4253,6 +4358,14 @@ def refine_with_prompt(
         if styling:
             screenshot_section = f"\n\nVisual reference:\n{json.dumps(styling, indent=2)}"
 
+    # Figma design reference (when user supplies Figma JSON alongside existing files)
+    figma_section = ""
+    if figma_json:
+        figma_summary = json.dumps(figma_json, indent=2)
+        if len(figma_summary) > 4000:
+            figma_summary = figma_summary[:4000] + "\n... (truncated)"
+        figma_section = f"\n\nFigma design tree (use as visual/structural reference):\n```json\n{figma_summary}\n```"
+
     mappings_text = "\n".join(
         f"  - {m.ds_selector} ({m.ds_component})"
         for m in (component_mappings or [])
@@ -4291,6 +4404,7 @@ SCSS:
 DS components in use:
 {mappings_text}
 {screenshot_section}
+{figma_section}
 
 Change requested: {prompt}"""
 
@@ -4321,6 +4435,7 @@ def run_figma_to_angular(
     design_system: str = "",
     fast_mode: bool = False,
     user_prompt: Optional[str] = None,
+    existing_files: Optional[Dict[str, str]] = None,
 ) -> "tuple[GeneratedAngularArtifact, Dict]":
     """Run the Figma → Angular pipeline.
 
@@ -4337,6 +4452,8 @@ def run_figma_to_angular(
                    threshold remains at 70 so only high-confidence DS mappings are
                    kept. Suitable for large designs where speed matters more than
                    maximising DS component coverage.
+        existing_files: Optional dict of user-supplied file contents to modify.
+                       Keys: "html", "typescript", "scss" (any subset).
 
     Raises:
         ValueError: If design_system is empty or no catalog file is found.
@@ -4413,6 +4530,7 @@ def run_figma_to_angular(
         "user_prompt": user_prompt or None,
         "prompt_research_context": None,
         "prompt_component_hints": [],
+        "existing_files": existing_files,
     }
 
     print("Invoking workflow...")

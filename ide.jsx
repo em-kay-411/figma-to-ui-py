@@ -349,6 +349,22 @@ function useStyleInjection() {
         color: var(--text-dim); font-size: 14px;
       }
       .code-empty svg { opacity: 0.15; }
+
+      /* ── Import button in file tabs ── */
+      .file-tab-actions { display: flex; align-items: center; gap: 4px; margin-left: auto; }
+      .btn-import {
+        font-family: var(--font-mono); font-size: 10px; font-weight: 500;
+        background: transparent; color: var(--text-dim); border: 1px solid var(--border);
+        border-radius: 2px; padding: 1px 6px; cursor: pointer;
+        transition: color 0.15s, border-color 0.15s;
+      }
+      .btn-import:hover { color: var(--accent); border-color: var(--accent); }
+
+      .code-placeholder {
+        position: absolute; top: 10px; left: 56px;
+        color: var(--text-dim); font-family: var(--font-mono); font-size: 13px;
+        pointer-events: none; user-select: none;
+      }
     `;
     document.head.appendChild(style);
 
@@ -433,6 +449,12 @@ export default function IDE() {
   const figmaInputRef = useRef(null);
   const gutterRef = useRef(null);
   const codeTextareaRef = useRef(null);
+
+  // ── Import file refs (per tab) ──
+  const importHtmlRef = useRef(null);
+  const importScssRef = useRef(null);
+  const importTsRef = useRef(null);
+  const importRefs = { html: importHtmlRef, scss: importScssRef, ts: importTsRef };
 
   // Drag-over state for drop zones
   const [screenshotDragOver, setScreenshotDragOver] = useState(false);
@@ -557,7 +579,8 @@ export default function IDE() {
   // ── Generate ──
   const handleGenerate = useCallback(async () => {
     if (!session?.session_id) return;
-    if (!promptText && !screenshotFile && !figmaFile) return;
+    const hasCodeFiles = files.html || files.scss || files.ts;
+    if (!promptText && !screenshotFile && !figmaFile && !hasCodeFiles) return;
     setIsGenerating(true);
     setError(null);
     try {
@@ -565,6 +588,11 @@ export default function IDE() {
       if (promptText) fd.append('prompt', promptText);
       if (screenshotFile) fd.append('screenshot', screenshotFile);
       if (figmaFile) fd.append('figma_json', figmaFile);
+      // Send existing file contents for full-pipeline refinement
+      if (files.html) fd.append('html_content', files.html);
+      if (files.scss) fd.append('scss_content', files.scss);
+      if (files.ts) fd.append('ts_content', files.ts);
+      if (componentName) fd.append('component_name', componentName);
       const data = await apiFetch(`/sessions/${session.session_id}/generate`, {
         method: 'POST',
         body: fd,
@@ -574,7 +602,7 @@ export default function IDE() {
     } catch {} finally {
       setIsGenerating(false);
     }
-  }, [session, promptText, screenshotFile, figmaFile, apiFetch, extractFiles]);
+  }, [session, promptText, screenshotFile, figmaFile, files, componentName, apiFetch, extractFiles]);
 
   // ── Refine ──
   const handleRefine = useCallback(async () => {
@@ -584,6 +612,18 @@ export default function IDE() {
     try {
       const body = { prompt: promptText };
       if (screenshotBase64) body.screenshot_base64 = screenshotBase64;
+      // Send file contents so refine can work with user-supplied code
+      if (files.html) body.html_content = files.html;
+      if (files.scss) body.scss_content = files.scss;
+      if (files.ts) body.ts_content = files.ts;
+      if (componentName) body.component_name = componentName;
+      // If user uploaded Figma JSON, read and send it as design reference
+      if (figmaFile) {
+        try {
+          const text = await figmaFile.text();
+          body.figma_json = JSON.parse(text);
+        } catch {}
+      }
       const data = await apiFetch(`/sessions/${session.session_id}/refine`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -601,7 +641,7 @@ export default function IDE() {
     } catch {} finally {
       setIsGenerating(false);
     }
-  }, [session, promptText, screenshotBase64, apiFetch, extractFiles]);
+  }, [session, promptText, screenshotBase64, files, componentName, figmaFile, apiFetch, extractFiles]);
 
   // ── New / End Session ──
   const handleNewSession = useCallback(async () => {
@@ -696,14 +736,14 @@ export default function IDE() {
   const handlePromptKeyDown = useCallback((e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
       e.preventDefault();
-      const hasGenerated = files.html || files.scss || files.ts;
+      const hasGenerated = lastGenerated.html || lastGenerated.scss || lastGenerated.ts;
       if (hasGenerated) {
         handleRefine();
       } else {
         handleGenerate();
       }
     }
-  }, [files, handleGenerate, handleRefine]);
+  }, [lastGenerated, handleGenerate, handleRefine]);
 
   // ── Resizable panels ──
   useEffect(() => {
@@ -768,9 +808,28 @@ export default function IDE() {
     }
   }, []);
 
+  // ── Import file into editor ──
+  const handleImportFile = useCallback((tab) => {
+    const ref = importRefs[tab];
+    if (ref?.current) ref.current.click();
+  }, []);
+
+  const onImportFileSelected = useCallback((tab, file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const content = reader.result;
+      setFiles((f) => ({ ...f, [tab]: content }));
+      setFileModified((m) => ({ ...m, [tab]: true }));
+      // Derive file path from imported filename
+      setFilePaths((p) => ({ ...p, [tab]: file.name }));
+    };
+    reader.readAsText(file);
+  }, []);
+
   // ── Helpers ──
   const hasFiles = files.html || files.scss || files.ts;
-  const hasInput = promptText || screenshotFile || figmaFile;
+  const hasInput = promptText || screenshotFile || figmaFile || hasFiles;
   const lineCount = (text) => (text ? text.split('\n').length : 0);
   const charCount = (text) => (text ? text.length : 0);
 
@@ -975,7 +1034,7 @@ export default function IDE() {
                 disabled={!hasInput || isGenerating || !session}
                 onClick={handleGenerate}
               >
-                {isGenerating && !hasFiles ? 'Generating...' : 'Generate'}
+                {isGenerating && !lastGenerated.html ? 'Generating...' : 'Generate'}
               </button>
               <button
                 className="btn btn-accent btn-refine"
@@ -987,7 +1046,7 @@ export default function IDE() {
             </div>
 
             <div className="hint-text">
-              At least one input required. {navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+Enter to submit.
+              Prompt, screenshot, Figma JSON, or code in editor. {navigator.platform.includes('Mac') ? '⌘' : 'Ctrl'}+Enter to submit.
             </div>
           </div>
 
@@ -1008,7 +1067,7 @@ export default function IDE() {
 
             {chatHistory.length === 0 && !isGenerating ? (
               <div className="chat-empty">
-                Upload a screenshot, paste Figma JSON, or describe a component to get started.
+                Upload a screenshot, paste Figma JSON, describe a component, or import existing files to get started.
               </div>
             ) : (
               <>
@@ -1045,7 +1104,7 @@ export default function IDE() {
                 <div className="dot" />
                 <div className="dot" />
                 <div className="dot" />
-                <span>{hasFiles ? 'Refining' : 'Generating'}...</span>
+                <span>{lastGenerated.html || lastGenerated.scss || lastGenerated.ts ? 'Refining' : 'Generating'}...</span>
               </div>
             )}
 
@@ -1061,15 +1120,15 @@ export default function IDE() {
 
         {/* ── Right Panel ── */}
         <div className="right-panel">
-          {hasFiles ? (
-            <>
-              {/* Top bar */}
-              <div className="code-topbar">
-                <div className="code-topbar-left">
-                  <AngularShield size={16} color="var(--accent)" />
-                  <span className="code-topbar-name">{componentName || 'Component'}</span>
-                </div>
-                <div className="code-topbar-right">
+          {/* Top bar */}
+          <div className="code-topbar">
+            <div className="code-topbar-left">
+              <AngularShield size={16} color="var(--accent)" />
+              <span className="code-topbar-name">{componentName || 'Component'}</span>
+            </div>
+            <div className="code-topbar-right">
+              {hasFiles && (
+                <>
                   <button
                     className="btn btn-ghost btn-sm"
                     onClick={handleCopyAll}
@@ -1082,72 +1141,101 @@ export default function IDE() {
                   >
                     Download .zip
                   </button>
-                </div>
-              </div>
-
-              {/* File tabs */}
-              <div className="file-tabs">
-                {['html', 'scss', 'ts'].map((tab) => (
-                  <div
-                    key={tab}
-                    className={`file-tab${activeFileTab === tab ? ' active' : ''}`}
-                    onClick={() => setActiveFileTab(tab)}
-                  >
-                    <span
-                      className={`file-tab-dot ${tab}${fileModified[tab] ? ' modified' : ''}`}
-                    />
-                    {tabLabels[tab]}
-                  </div>
-                ))}
-              </div>
-
-              {/* Code editor */}
-              <div className="code-editor-wrap">
-                <div className="code-gutter" ref={gutterRef}>
-                  {gutterNumbers}
-                </div>
-                <textarea
-                  ref={codeTextareaRef}
-                  className="code-textarea"
-                  value={activeCode}
-                  onChange={(e) => handleCodeChange(activeFileTab, e.target.value)}
-                  onScroll={handleCodeScroll}
-                  spellCheck={false}
-                />
-              </div>
-
-              {/* Status bar */}
-              <div className="code-statusbar">
-                <div className="code-statusbar-left">
-                  <span>{activeFileTab.toUpperCase()}</span>
-                  <span>{charCount(activeCode)} chars</span>
-                  <span>{activeLines} lines</span>
-                </div>
-                <div className="code-statusbar-right">
-                  <button
-                    className="btn btn-ghost btn-sm"
-                    onClick={() => handleCopyFile(activeFileTab)}
-                  >
-                    {fileCopyState[activeFileTab] === 'copied' ? 'Copied!' : 'Copy'}
-                  </button>
-                  {fileModified[activeFileTab] && (
-                    <button
-                      className="btn btn-warning btn-sm"
-                      onClick={() => handleResetFile(activeFileTab)}
-                    >
-                      Reset
-                    </button>
-                  )}
-                </div>
-              </div>
-            </>
-          ) : (
-            /* Empty state */
-            <div className="code-empty">
-              <AngularShield size={64} color="var(--text-dim)" />
-              <span>Your generated Angular component will appear here.</span>
+                </>
+              )}
             </div>
-          )}
+          </div>
+
+          {/* File tabs with import buttons */}
+          <div className="file-tabs">
+            {['html', 'scss', 'ts'].map((tab) => (
+              <div
+                key={tab}
+                className={`file-tab${activeFileTab === tab ? ' active' : ''}`}
+                onClick={() => setActiveFileTab(tab)}
+              >
+                <span
+                  className={`file-tab-dot ${tab}${fileModified[tab] ? ' modified' : ''}`}
+                />
+                {tabLabels[tab]}
+              </div>
+            ))}
+            <div className="file-tab-actions">
+              <button
+                className="btn-import"
+                title={`Import ${activeFileTab.toUpperCase()} file`}
+                onClick={(e) => { e.stopPropagation(); handleImportFile(activeFileTab); }}
+              >
+                Import
+              </button>
+            </div>
+          </div>
+
+          {/* Hidden file inputs for import */}
+          <input
+            ref={importHtmlRef}
+            type="file"
+            accept=".html,.htm"
+            style={{ display: 'none' }}
+            onChange={(e) => { onImportFileSelected('html', e.target.files?.[0]); e.target.value = ''; }}
+          />
+          <input
+            ref={importScssRef}
+            type="file"
+            accept=".scss,.css"
+            style={{ display: 'none' }}
+            onChange={(e) => { onImportFileSelected('scss', e.target.files?.[0]); e.target.value = ''; }}
+          />
+          <input
+            ref={importTsRef}
+            type="file"
+            accept=".ts,.js"
+            style={{ display: 'none' }}
+            onChange={(e) => { onImportFileSelected('ts', e.target.files?.[0]); e.target.value = ''; }}
+          />
+
+          {/* Code editor */}
+          <div className="code-editor-wrap">
+            <div className="code-gutter" ref={gutterRef}>
+              {gutterNumbers}
+            </div>
+            <textarea
+              ref={codeTextareaRef}
+              className="code-textarea"
+              value={activeCode}
+              onChange={(e) => handleCodeChange(activeFileTab, e.target.value)}
+              onScroll={handleCodeScroll}
+              spellCheck={false}
+              placeholder={`Paste or import your ${activeFileTab.toUpperCase()} code here, or generate from the left panel...`}
+            />
+          </div>
+
+          {/* Status bar */}
+          <div className="code-statusbar">
+            <div className="code-statusbar-left">
+              <span>{activeFileTab.toUpperCase()}</span>
+              <span>{charCount(activeCode)} chars</span>
+              <span>{activeLines} lines</span>
+            </div>
+            <div className="code-statusbar-right">
+              {activeCode && (
+                <button
+                  className="btn btn-ghost btn-sm"
+                  onClick={() => handleCopyFile(activeFileTab)}
+                >
+                  {fileCopyState[activeFileTab] === 'copied' ? 'Copied!' : 'Copy'}
+                </button>
+              )}
+              {fileModified[activeFileTab] && (
+                <button
+                  className="btn btn-warning btn-sm"
+                  onClick={() => handleResetFile(activeFileTab)}
+                >
+                  Reset
+                </button>
+              )}
+            </div>
+          </div>
         </div>
       </div>
     </div>
