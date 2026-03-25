@@ -168,8 +168,6 @@ function useStyleInjection() {
       .drop-zone-clear:hover { color: var(--error); border-color: var(--error); }
 
       .action-row { display: flex; gap: 6px; }
-      .action-row .btn-generate { flex: 6; }
-      .action-row .btn-refine { flex: 4; }
 
       .hint-text { font-size: 11px; color: var(--text-dim); text-align: center; }
 
@@ -576,7 +574,7 @@ export default function IDE() {
     setScreenshotBase64(b64);
   }, []);
 
-  // ── Generate ──
+  // ── Generate (unified — handles both fresh generation and refinement) ──
   const handleGenerate = useCallback(async () => {
     if (!session?.session_id) return;
     const hasCodeFiles = files.html || files.scss || files.ts;
@@ -588,7 +586,8 @@ export default function IDE() {
       if (promptText) fd.append('prompt', promptText);
       if (screenshotFile) fd.append('screenshot', screenshotFile);
       if (figmaFile) fd.append('figma_json', figmaFile);
-      // Send existing file contents for full-pipeline refinement
+      if (screenshotBase64) fd.append('screenshot_base64', screenshotBase64);
+      // Send code editor contents through the full pipeline
       if (files.html) fd.append('html_content', files.html);
       if (files.scss) fd.append('scss_content', files.scss);
       if (files.ts) fd.append('ts_content', files.ts);
@@ -597,51 +596,19 @@ export default function IDE() {
         method: 'POST',
         body: fd,
       });
-      extractFiles(data);
-      setSession((s) => ({ ...s, last_active: new Date().toISOString() }));
-    } catch {} finally {
-      setIsGenerating(false);
-    }
-  }, [session, promptText, screenshotFile, figmaFile, files, componentName, apiFetch, extractFiles]);
-
-  // ── Refine ──
-  const handleRefine = useCallback(async () => {
-    if (!session?.session_id || !promptText) return;
-    setIsGenerating(true);
-    setError(null);
-    try {
-      const body = { prompt: promptText };
-      if (screenshotBase64) body.screenshot_base64 = screenshotBase64;
-      // Send file contents so refine can work with user-supplied code
-      if (files.html) body.html_content = files.html;
-      if (files.scss) body.scss_content = files.scss;
-      if (files.ts) body.ts_content = files.ts;
-      if (componentName) body.component_name = componentName;
-      // If user uploaded Figma JSON, read and send it as design reference
-      if (figmaFile) {
-        try {
-          const text = await figmaFile.text();
-          body.figma_json = JSON.parse(text);
-        } catch {}
-      }
-      const data = await apiFetch(`/sessions/${session.session_id}/refine`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
       setLastRefineAction(data.action || null);
-      if (data.action === 'APPLY_REFINE' || data.action === 'RESOLVE_UNRESOLVED') {
+      if (data.action === 'APPLY') {
         extractFiles(data);
       } else {
         // OUT_OF_SCOPE or CLARIFY — only update chat
         if (data.chat_history) setChatHistory(data.chat_history);
       }
       setSession((s) => ({ ...s, last_active: new Date().toISOString() }));
-      setPromptText('');
+      if (promptText) setPromptText('');
     } catch {} finally {
       setIsGenerating(false);
     }
-  }, [session, promptText, screenshotBase64, files, componentName, figmaFile, apiFetch, extractFiles]);
+  }, [session, promptText, screenshotFile, screenshotBase64, figmaFile, files, componentName, apiFetch, extractFiles]);
 
   // ── New / End Session ──
   const handleNewSession = useCallback(async () => {
@@ -736,14 +703,9 @@ export default function IDE() {
   const handlePromptKeyDown = useCallback((e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
       e.preventDefault();
-      const hasGenerated = lastGenerated.html || lastGenerated.scss || lastGenerated.ts;
-      if (hasGenerated) {
-        handleRefine();
-      } else {
-        handleGenerate();
-      }
+      handleGenerate();
     }
-  }, [lastGenerated, handleGenerate, handleRefine]);
+  }, [handleGenerate]);
 
   // ── Resizable panels ──
   useEffect(() => {
@@ -1027,21 +989,19 @@ export default function IDE() {
               onChange={(e) => setFigmaFile(e.target.files?.[0] || null)}
             />
 
-            {/* Action buttons */}
+            {/* Action button */}
             <div className="action-row">
               <button
-                className="btn btn-accent btn-generate"
+                className="btn btn-accent"
+                style={{ flex: 1 }}
                 disabled={!hasInput || isGenerating || !session}
                 onClick={handleGenerate}
               >
-                {isGenerating && !lastGenerated.html ? 'Generating...' : 'Generate'}
-              </button>
-              <button
-                className="btn btn-accent btn-refine"
-                disabled={!promptText || !hasFiles || isGenerating || !session}
-                onClick={handleRefine}
-              >
-                {isGenerating && hasFiles ? 'Refining...' : 'Refine'}
+                {isGenerating
+                  ? 'Processing...'
+                  : lastGenerated.html || lastGenerated.scss || lastGenerated.ts
+                    ? 'Regenerate'
+                    : 'Generate'}
               </button>
             </div>
 
@@ -1104,7 +1064,7 @@ export default function IDE() {
                 <div className="dot" />
                 <div className="dot" />
                 <div className="dot" />
-                <span>{lastGenerated.html || lastGenerated.scss || lastGenerated.ts ? 'Refining' : 'Generating'}...</span>
+                <span>Processing...</span>
               </div>
             )}
 
