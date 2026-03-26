@@ -3858,6 +3858,59 @@ def generate_from_prompt(
     return artifact
 
 
+# Categories that NEVER need the full pipeline — a direct LLM edit suffices.
+_FAST_PATH_CATEGORIES = frozenset({
+    "VISUAL_STYLE",
+    "LAYOUT_STRUCTURAL",
+    "DATA_LOGIC_BEHAVIOR",
+    "ACCESSIBILITY_PROPERTY",
+})
+
+
+def _should_use_fast_path(
+    prompt: Optional[str],
+    existing_files: Optional[Dict[str, str]],
+    design_system: str,
+) -> "Optional[IntentClassification]":
+    """Decide whether a prompt+files combo can skip the full pipeline.
+
+    Returns the IntentClassification if the fast path should be used, else None.
+    Fast path criteria — ALL must be true:
+      1. User supplied existing files (at least one)
+      2. User supplied a text prompt
+      3. No Figma JSON / screenshot (those imply a visual design to analyse)
+      4. Intent is a simple category (style, layout, logic, a11y)
+      5. No new DS components requested (those need catalog lookup + doc research)
+    """
+    if not prompt:
+        return None
+    if not existing_files or not any(existing_files.values()):
+        return None
+
+    catalog = load_ds_catalog(design_system)
+    if not catalog:
+        return None
+
+    # Build a throwaway artifact for intent classification
+    artifact = build_artifact_from_files(
+        html_content=existing_files.get("html"),
+        scss_content=existing_files.get("scss"),
+        ts_content=existing_files.get("typescript"),
+    )
+
+    intent = classify_refine_intent(prompt, artifact, catalog)
+
+    if intent.category not in _FAST_PATH_CATEGORIES:
+        return None
+    # Only block the fast path when the intent actually needs DS lookup AND
+    # new components were requested (e.g. "add a button" → needs catalog).
+    # Incidental term matches (e.g. "aria labels" matching "label" hint) are
+    # harmless when the category doesn't require catalog lookup.
+    if intent.requires_catalog_lookup and intent.new_components_requested:
+        return None
+    return intent
+
+
 def generate_angular_component(
     design_system: str,
     figma_json: Optional[Dict] = None,
@@ -3870,8 +3923,14 @@ def generate_angular_component(
     """Unified entry point for all generate paths.
 
     Accepts any combination of figma_json, screenshot_path, prompt, and existing_files.
-    When existing_files is provided, the pipeline uses those files as the starting
-    point and modifies them according to the prompt/screenshot/figma design.
+
+    Fast path: when the user has existing files + a simple prompt (styling, layout,
+    logic, a11y) that doesn't need DS component lookup, skips the full pipeline and
+    applies changes via a single LLM call.
+
+    Full pipeline: for DS-heavy tasks (component swaps, first generation from
+    scratch, screenshot/figma-based generation) runs Ingest → Prune → IR → DS Map
+    → CodeGen → Validate → Repair.
 
     Returns (artifact, pipeline_metadata) where pipeline_metadata contains
     phase1_research_context, ds_coverage, and other state for session persistence.
@@ -3882,6 +3941,34 @@ def generate_angular_component(
             "At least one of figma_json, screenshot_path, prompt, or existing_files is required"
         )
 
+    # ── Fast path: simple edits on existing files ──
+    # Only when there's no figma_json / screenshot driving a visual design pass.
+    if has_files and not figma_json and not screenshot_path:
+        intent = _should_use_fast_path(prompt, existing_files, design_system)
+        if intent is not None:
+            print(f"Fast path: {intent.category} — skipping full pipeline")
+            artifact_in = build_artifact_from_files(
+                html_content=existing_files.get("html"),
+                scss_content=existing_files.get("scss"),
+                ts_content=existing_files.get("typescript"),
+            )
+            artifact, refine_meta = refine_with_prompt(
+                current_artifact=artifact_in,
+                prompt=prompt,
+                design_system=design_system,
+                intent=intent,
+            )
+            catalog = load_ds_catalog(design_system)
+            pipeline_metadata = {
+                "phase1_research_context": "",
+                "ds_coverage": (
+                    compute_ds_coverage(artifact, design_system, catalog).as_dict()
+                    if catalog else {}
+                ),
+            }
+            return artifact, pipeline_metadata
+
+    # ── Full pipeline ──
     # When user supplies files but no Figma JSON, convert their HTML to a
     # synthetic Figma tree so the pipeline can run IR → DS mapping on it.
     if figma_json is None:
